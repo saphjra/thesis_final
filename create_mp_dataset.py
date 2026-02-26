@@ -1,11 +1,9 @@
 import numpy as np
 import polars as pl
+from constants import ET_DATA_TO_INCLUDE, META_DATA_TO_INCLUDE
 
-
-def _create_stimuli_dataframe(img_with_paths: str, n_page = 23, ) -> pl.DataFrame:
+def _create_stimuli_dataframe(img_with_paths: str, n_pages = 23, ) -> pl.DataFrame:
     df = pl.DataFrame(pl.read_csv(img_with_paths))
-
-    n_pages = 23
 
     text_cols = [f"page_{i + 1}" for i in range(n_pages)]
     img_cols = [f"page_{i + 1}_img_file" for i in range(n_pages)]
@@ -35,9 +33,13 @@ def _create_stimuli_dataframe(img_with_paths: str, n_page = 23, ) -> pl.DataFram
     stimuli = stimuli.drop_nulls().cast({"stimulus_id": pl.String})
     return stimuli
 
-def _create_eyetracking_dataframe(data_regex = "data/**/raw_data/*.csv") -> pl.LazyDataFrame:
+def _create_eyetracking_dataframe(data_folder_regex, et_data_to_include=ET_DATA_TO_INCLUDE) -> pl.lazyframe:
+    """Reads all CSV files matching the given regex pattern, extracts participant_id and stimulus_id from the file paths, and combines them into a single DataFrame.
+    with the et_data_to_include columns as a struct column named "data". and one can decide if pupil and for example timestamps should be included or not.
+    The resulting DataFrame will have columns: page, file_path, participant_id, stimulus_id, and data (which is a struct containing the specified et_data_to_include columns)."""
+
     eyetracking = (
-        pl.scan_csv(data_regex, include_file_paths="file_path")
+        pl.scan_csv(data_folder_regex, include_file_paths="file_path")
         .with_columns(
             pl.col("file_path")
             .str.extract(r"([^/]+)\.csv$", 1)  # get filename
@@ -48,7 +50,7 @@ def _create_eyetracking_dataframe(data_regex = "data/**/raw_data/*.csv") -> pl.L
         )
     )
     eyetracking = eyetracking.with_columns(
-        pl.struct(["time", "pixel_x", "pixel_y", "pupil"]).alias("data")
+        pl.struct(et_data_to_include).alias("data")
     )
     eyetracking = (
         eyetracking
@@ -56,9 +58,7 @@ def _create_eyetracking_dataframe(data_regex = "data/**/raw_data/*.csv") -> pl.L
             "page",
             "file_path",
             "participant_id",
-            "stimulus_id",
-            # "file_name",
-            # "text",   # if you have it
+            "stimulus_id"
         ])
         .agg(
             pl.col("data")
@@ -66,7 +66,7 @@ def _create_eyetracking_dataframe(data_regex = "data/**/raw_data/*.csv") -> pl.L
     )
     return eyetracking
 
-def create_mp_metadata(img_with_paths: str, out_dir: dir, data_regex = "data/**/raw_data/*.csv") -> None:
+def create_mp_metadata(img_with_paths: str, out_dir: dir, data_regex = "data/**/raw_data/*.csv", data_to_include = META_DATA_TO_INCLUDE) -> None:
     stimuli = _create_stimuli_dataframe(img_with_paths)
     eyetracking = _create_eyetracking_dataframe(data_regex)
     # Join the two DataFrames on the stimulus_id and page columns
@@ -74,5 +74,5 @@ def create_mp_metadata(img_with_paths: str, out_dir: dir, data_regex = "data/**/
         eyetracking
         .join(stimuli.lazy(), on=["page", "stimulus_id"], how="left")
     )
-    combined = combined.drop_nulls().select(["file_name", "file_path", "participant_id", "text", "data"])
+    combined = combined.drop_nulls().select(data_to_include)
     combined.sink_ndjson(out_dir / "metadata.jsonl")
