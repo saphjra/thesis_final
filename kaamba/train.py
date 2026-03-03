@@ -22,7 +22,7 @@ def train(dataset_path = "data/processed_gaze_dataset"):
         lr=1e-4
     )
 
-    loader = DataLoader(dataset["train"], batch_size=8, shuffle=True)
+    loader = DataLoader(dataset["train"], batch_size=1)
 
     model.train()
 

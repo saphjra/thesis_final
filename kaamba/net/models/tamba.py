@@ -4,7 +4,7 @@ from transformers import ViTModel
 
 
 class GazePredictor(nn.Module):
-    def __init__(self, d_model=256, n_heads=4, n_layers=3):
+    def __init__(self, d_model=224, n_heads=4, n_layers=3):
         super().__init__()
 
         # Vision encoder
@@ -14,7 +14,7 @@ class GazePredictor(nn.Module):
 
         self.img_proj = nn.Linear(768, d_model)
 
-        self.gaze_proj = nn.Linear(3, d_model)
+        self.gaze_proj = nn.Linear(2, d_model)
 
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=d_model,

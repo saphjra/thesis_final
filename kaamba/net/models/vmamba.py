@@ -99,7 +99,7 @@ def flops_selective_scan_ref(B=1, L=256, D=768, N=16, with_D=True, with_Z=False,
     else:
         flops += get_flops_einsum([[B, D, L], [B, D, N, L], [B, D, L]], "bdl,bdnl,bdl->bdln")
     if False:
-        ...
+        pass
         """
         deltaA = torch.exp(torch.einsum('bdl,dn->bdln', delta, A))
         if not is_variable_B:
