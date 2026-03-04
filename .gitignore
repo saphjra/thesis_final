@@ -1,7 +1,7 @@
-/kaamba/kaamba_dataset/data.parquet
-/kaamba/data/MultiplEYE_DE_DE_Goettingen_1_2026/stimuli_MultiplEYE_DE_DE_Goettingen_1_2026/stimuli_images_de_de_1/
-/kaamba/data/
-/kaamba/kaamba_dataset/stimuli/
+/kaamba_repo/kaamba_dataset/data.parquet
+/kaamba_repo/data/MultiplEYE_DE_DE_Goettingen_1_2026/stimuli_MultiplEYE_DE_DE_Goettingen_1_2026/stimuli_images_de_de_1/
+/kaamba_repo/data/
+/kaamba_repo/kaamba_dataset/stimuli/
 CODE_COMPARISON.md
 IMPLEMENTATION_GUIDE.md
 INDEX.md

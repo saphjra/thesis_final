@@ -5,15 +5,17 @@ Converts JSONL metadata to optimized formats for memory efficiency.
 
 import polars as pl
 from pathlib import Path
-import json
-from typing import Optional
+
 import time
+from datasets import DatasetBuilder, DatasetInfo, Features, Array2D, Sequence, Value
+from pathlib import Path
+import os
 
 
 def convert_jsonl_to_parquet(
     input_path: str,
-    output_path: str,
-    compression: str = "snappy",
+    output_path: str | Path | None = None,
+    compression: str = "gzip",
     batch_size: int = 10000,
 ) -> None:
     """
@@ -31,6 +33,8 @@ def convert_jsonl_to_parquet(
         compression: 'snappy' (fast), 'gzip' (good compression), 'brotli' (best)
         batch_size: Number of rows per batch
     """
+    if output_path is None:
+        output_path = Path(input_path).with_suffix(".parquet")
     print(f"Converting {input_path} to Parquet...")
     start = time.time()
 
@@ -121,9 +125,7 @@ def create_hf_dataset_config(
 
     # Create dataset.py script
     dataset_script = ''''''
-from datasets import DatasetBuilder, DatasetInfo, Features, Array2D, Sequence, Value
-from pathlib import Path
-import os
+
 
 class CustomGazeDataset(DatasetBuilder):
     VERSION = "1.0.0"
@@ -152,7 +154,6 @@ class CustomGazeDataset(DatasetBuilder):
         ]
 
     def _generate_examples(self, shard_files):
-        import polars as pl
         for shard_idx, shard_file in enumerate(shard_files):
             data = pl.read_parquet(str(shard_file))
             for idx, row in enumerate(data.iter_rows(named=True)):
@@ -160,11 +161,11 @@ class CustomGazeDataset(DatasetBuilder):
 
 
     # Create README
-    readme = f'''# Eyetracking Dataset
+readme = f'''# Eyetracking Dataset
 
 This is a sharded eyetracking dataset optimized for streaming.
 
-## Format
+## Format   
 - Format: Parquet (columnar, compressed)
 - Shards: Multiple files for parallel loading
 - Compression: Snappy
@@ -173,14 +174,15 @@ This is a sharded eyetracking dataset optimized for streaming.
 
 ### With HuggingFace Datasets
 ```python
+out_dir = "kaamba_dataset/sharded"
 from datasets import load_dataset
-dataset = load_dataset("{output_dir}", split="train", streaming=True)
+dataset = load_dataset("output_dir", split="train", streaming=True)
 ```
 
 ### With Polars
 ```python
 import polars as pl
-data = pl.scan_parquet("{output_dir}/shard-*.parquet")
+data = pl.scan_parquet("output_dir/shard-*.parquet")
 ```
 
 ### With PyTorch
@@ -188,7 +190,7 @@ data = pl.scan_parquet("{output_dir}/shard-*.parquet")
 from torch.utils.data import DataLoader
 from datasets import load_dataset
 
-dataset = load_dataset("{output_dir}", streaming=True)
+dataset = load_dataset("output_dir", streaming=True)
 loader = DataLoader(dataset, batch_size=32, num_workers=4)
 ```
 
@@ -202,14 +204,14 @@ loader = DataLoader(dataset, batch_size=32, num_workers=4)
 2. Set `pin_memory=True` for GPU training
 3. Adjust batch_size based on GPU memory
 4. Monitor disk I/O to ensure sufficient bandwidth
-'''
+
 
     config_file = output_path / "README.md"
     with open(config_file, "w") as f:
         f.write(readme)
 
-    print(f"✓ Configuration created: {config_file}")
-
+    print(f"✓ Configuration created: config_file")
+'''
 
 def estimate_memory_usage(
     input_path: str,
@@ -258,8 +260,8 @@ def estimate_memory_usage(
 
 if __name__ == "__main__":
     # Example: Convert and shard your dataset
-
-    input_file = "kaamba/data/MultiplEYE_DE_DE_Goettingen_1_2026/stimuli_MultiplEYE_DE_DE_Goettingen_1_2026/stimuli_images_de_de_1/metadata.jsonl"
+    from constants import STIMULUS_FOLDER
+    input_file = str(STIMULUS_FOLDER / "Goettingen/metadata_Goettingen.jsonl")
 
     # Step 1: Convert JSONL to Parquet
     print("=" * 60)
@@ -276,7 +278,7 @@ if __name__ == "__main__":
     print("=" * 60)
     shard_large_dataset(
         input_file.replace(".jsonl", ".parquet"),
-        "kaamba_dataset/sharded",
+        str(STIMULUS_FOLDER / "Goettingen/sharded"),
         num_shards=10,
     )
 

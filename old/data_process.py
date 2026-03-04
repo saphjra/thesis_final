@@ -7,7 +7,7 @@ import polars as pl
 from pathlib import Path
 from typing import Optional
 
-from kaamba.kaamba_dataset.constants import ROOT_DIR
+from kaamba_repo.kaamba_dataset.constants import ROOT_DIR
 
 
 # MEMORY-OPTIMIZED EYETRACKING DATASET HANDLING

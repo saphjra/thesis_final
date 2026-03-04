@@ -30,7 +30,7 @@ def _create_stimuli_dataframe(img_with_paths: str, n_pages = 23) -> pl.DataFrame
         "page": np.array([[f"page_{i + 1}"] * df.height for i in range(n_pages)]).flatten(),
         "stimulus_id": stimulus_cols,
     })
-    stimuli = stimuli.drop_nulls().cast({"stimulus_id": pl.String})
+    stimuli = stimuli.drop_nulls().cast({"stimulus_id": pl.String}) #remove all non text pages (questions and familiarity ratings)
     return stimuli
 
 def _create_eyetracking_dataframe(data_folder_regex, et_data_to_include=ET_DATA_TO_INCLUDE) -> pl.lazyframe:
@@ -49,13 +49,15 @@ def _create_eyetracking_dataframe(data_folder_regex, et_data_to_include=ET_DATA_
             # extract stimulus id from filename
         )
     )
+    #eyetracking = eyetracking.fill_null(strategy = "zero")
     eyetracking = eyetracking.with_columns(
-        pl.col("pixel_y").cast(pl.Float32),
-        pl.col("pixel_x").cast(pl.Float32),
-        pl.col("pupil").cast(pl.Float32),
-        pl.col("time").cast(pl.Float32),
-        pl.struct(et_data_to_include).alias("data"),
+        pl.col("pixel_y").fill_null(0).cast(pl.Float32),
+        pl.col("pixel_x").fill_null(0).cast(pl.Float32),
+        pl.col("pupil").fill_null(0).cast(pl.Float32),
+        pl.col("time").fill_null(0).cast(pl.Float32),
+
     )
+    eyetracking = eyetracking.with_columns(pl.struct(et_data_to_include).alias("data"))
     eyetracking = (
         eyetracking
         .group_by([
@@ -86,15 +88,11 @@ def create_mp_metadata(img_with_paths: str, out_dir: dir, data_regex = "data/**/
 if __name__ == "__main__":
     import argparse
     from pathlib import Path
-    from constants import ROOT_DIR
 
-
-    import os
-    POLARS_VERBOSE = 1
     parser = argparse.ArgumentParser(description="Create metadata for MultiplEYE dataset")
-    parser.add_argument("--img_with_paths", type=str, default="C:/Users/saphi/PycharmProjects/thesis/kaamba/data/MultiplEYE_DE_DE_Goettingen_1_2026/stimuli_MultiplEYE_DE_DE_Goettingen_1_2026/multipleye_stimuli_experiment_de_de_1_with_img_paths.csv", help="Path to the CSV file containing image paths and text")
-    parser.add_argument("--out_dir", type=str, default="C:/Users/saphi/PycharmProjects/thesis/kaamba/kaamba_dataset/stimuli/Goettingen", help="Directory to save the output metadata")
-    parser.add_argument("--data_regex", type=str, default="C:/Users/saphi/PycharmProjects/thesis/kaamba/data/MultiplEYE_DE_DE_Goettingen_1_2026/**/raw_data/*.csv", help="Regex pattern to match eyetracking data files")
+    parser.add_argument("--img_with_paths", type=str, default="C:/Users/saphi/PycharmProjects/thesis/data/MultiplEYE_DE_DE_Goettingen_1_2026/stimuli_MultiplEYE_DE_DE_Goettingen_1_2026/multipleye_stimuli_experiment_de_de_1_with_img_paths.csv", help="Path to the CSV file containing image paths and text")
+    parser.add_argument("--out_dir", type=str, default="C:/Users/saphi/PycharmProjects/thesis/kaamba_repo/src/kaamba/kaamba_dataset/stimuli/Goettingen", help="Directory to save the output metadata")
+    parser.add_argument("--data_regex", type=str, default="C:/Users/saphi/PycharmProjects/thesis/data/MultiplEYE_DE_DE_Goettingen_1_2026/**/raw_data/*.csv", help="Regex pattern to match eyetracking data files")
     parser.add_argument("--data_to_include", nargs="+", default=META_DATA_TO_INCLUDE, help="List of metadata fields to include in the output")
 
     args = parser.parse_args()

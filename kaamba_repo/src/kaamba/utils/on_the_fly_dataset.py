@@ -15,8 +15,8 @@ import numpy as np
 import polars as pl
 from pathlib import Path
 from typing import Iterator, Dict, Optional, Tuple
-import random
-from constants import STIMULUS_FOLDER, SCREEN_RESOLUTION
+
+from .constants import STIMULUS_FOLDER, SCREEN_RESOLUTION
 from torchvision.transforms import v2
 from torchvision.io import decode_image
 
@@ -158,7 +158,7 @@ class OnTheFlyGazeDataset(IterableDataset):
 
             # Convert to numpy arrays
             input_seq = np.array(
-                [[g["pixel_x"] * self.scaling_factor  if g["pixel_x"] is not None else 0, g["pixel_y"] * self.scaling_factor  if g["pixel_y"] is not None else 0] for g in input_gaze],
+                [[g["pixel_x"] * self.scaling_factor  if type(g["pixel_x"]) is float else 0, g["pixel_y"] * self.scaling_factor  if g["pixel_y"] is not None else 0] for g in input_gaze],
                 dtype=np.float32
             )
             target_seq = np.array(
@@ -235,7 +235,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print("On-the-Fly Sequence Generation Example")
     print("=" * 60)
-    path = STIMULUS_FOLDER / "Goettingen" / "metadata_Goettingen.jsonl"  # Adjust path as needed
+    path = STIMULUS_FOLDER / "Goettingen" / "metadata_Goettingen.parquet"  # Adjust path as needed
     import os
     print(os.path.exists(path))  # Check if file exists
     # Create loader
@@ -243,8 +243,8 @@ if __name__ == "__main__":
         path,  # or "metadata.jsonl"
         batch_size=32,
         num_workers=4,
-        context_len=32,
-        stride=100,
+        context_len=40,
+        stride=10,
         dataset_type="standard",
     )
 
@@ -255,7 +255,7 @@ if __name__ == "__main__":
             break
 
         print(f"\nBatch {batch_idx}:")
-        print(f"  Input shape: {batch['input_seq']}")
+        print(f"  Input shape: {batch['input_seq'].shape}")
         print(f"  Target shape: {batch['target_seq'].shape}")
         print(f"  img shape: {batch['image'].shape}")
 
