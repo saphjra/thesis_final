@@ -63,6 +63,7 @@ class OnTheFlyGazeDataset(IterableDataset):
         stride: int = 1,
         lazy: bool = True,
         max_image_size: int = 512,
+        image_folder_path: Optional[str] = None,
     ):
         """
         Args:
@@ -79,6 +80,10 @@ class OnTheFlyGazeDataset(IterableDataset):
         self.stride = stride
         self.lazy = lazy
         self.max_image_size = max_image_size
+        if image_folder_path is None:
+            self.image_folder_path = self.metadata_path.parent
+        else:
+            self.image_folder_path = Path(image_folder_path)
 
         # Load metadata lazily
         if self.metadata_path.suffix == ".parquet":
@@ -149,7 +154,7 @@ class OnTheFlyGazeDataset(IterableDataset):
         Yields:
             Dict with input_seq, target_seq, stimulus image and metadata
         """
-        transformed_image = self._image_transform(STIMULUS_FOLDER/ self.datacollection_name / row.get("file_name"))
+        transformed_image = self._image_transform(self.metadata_path.parent/ row.get("file_name"))
         # Generate sequences with specified stride
         for i in range(0, len(gaze_data) - self.context_len, self.stride):
             # Extract input and target sequences

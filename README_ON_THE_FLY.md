@@ -19,12 +19,6 @@ I've created a complete implementation for generating gaze sequences **on-the-fl
    - Includes memory monitoring
    - Checkpoint saving
 
-3. **`kaamba/train_quick_start.py`** - Quick start guide
-   - Option 1: Minimal changes
-   - Option 2: Better approach
-   - Option 3: Full-featured
-   - Pick your level of complexity
-
 ### Utilities
 4. **`kaamba/utils/convert_dataset.py`** - Format conversion tools
    - Convert JSONL → Parquet
@@ -37,33 +31,11 @@ I've created a complete implementation for generating gaze sequences **on-the-fl
    - Performance tracking
 
 ### Documentation
-6. **`LARGE_DATASET_GUIDE.md`** - Overview of all approaches
-7. **`ON_THE_FLY_GUIDE.md`** - Detailed on-the-fly explanation
-8. **`VISUAL_COMPARISON.md`** - Visual diagrams and comparisons
-9. **`IMPLEMENTATION_GUIDE.md`** - Step-by-step implementation
-
-## Key Idea: On-the-Fly Generation
-
-### Old Way (Problems):
-```
-Raw data → Generate ALL sequences → Save (25 GB) → Train
-           (4 hours)                                (slow I/O)
-```
-
-### New Way (Solution):
-```
-Raw data → Train (generate sequences as needed in parallel)
-           (5 min setup, no preprocessing!)
-```
+``
 
 ## How It Works
 
 ```python
-# Instead of this (old):
-dataset = dataset.map(transform_gaze)  # Creates 968k sequences
-dataset.save_to_disk("output")         # 25 GB
-dataset = load_from_disk("output")
-
 # Do this (new):
 loader = create_on_the_fly_loader(
     "metadata.parquet",
@@ -75,21 +47,11 @@ loader = create_on_the_fly_loader(
 # That's it! Sequences generated on-demand, no storage needed!
 ```
 
-## Key Benefits
-
-| Aspect | Old Way | New Way | Improvement |
-|--------|---------|---------|-------------|
-| **Storage** | 25 GB | 500 MB | 50x less |
-| **Preprocessing** | 4 hours | 5 min | 48x faster |
-| **Training RAM** | 16 GB | 4 GB | 4x less |
-| **Training speed** | 50 samples/s | 200 samples/s | 4x faster |
-| **Context_len** | Fixed ❌ | Change anytime ✅ | Infinite flexibility |
-
-## Quick Start (Pick One)
 
 ### Option A: Minimal Changes (1 minute)
+
 ```python
-from kaamba.utils.on_the_fly_dataset import create_on_the_fly_loader
+from kaamba_repo.utils.on_the_fly_dataset import create_on_the_fly_loader
 
 # Replace your DataLoader with this
 loader = create_on_the_fly_loader(
@@ -101,24 +63,6 @@ loader = create_on_the_fly_loader(
 # Everything else stays the same!
 for batch in loader:
     output = model(batch["input_seq"])
-```
-
-### Option B: Full Implementation (5 minutes)
-```python
-from kaamba.train_quick_start import train_full_featured
-
-train_full_featured(
-    metadata_path="metadata.parquet",
-    batch_size=32,
-    num_workers=4,
-    context_len=32,
-)
-```
-
-### Option C: Copy from Existing Script (2 minutes)
-```bash
-cp kaamba/train_quick_start.py kaamba/train.py
-# Now use it!
 ```
 
 ## What You Need to Know
@@ -163,8 +107,9 @@ All in parallel → No bottleneck!
 ## Advanced Features
 
 ### 1. Random Stride (Better Generalization)
+
 ```python
-from kaamba.utils.on_the_fly_dataset import RandomStridedGazeDataset
+from kaamba_repo.utils.on_the_fly_dataset import RandomStridedGazeDataset
 
 dataset = RandomStridedGazeDataset(
     "metadata.parquet",
@@ -180,8 +125,9 @@ dataset = RandomStridedGazeDataset(
 ```
 
 ### 2. Adaptive Sequence Length
+
 ```python
-from kaamba.utils.on_the_fly_dataset import AdaptiveContextGazeDataset
+from kaamba_repo.utils.on_the_fly_dataset import AdaptiveContextGazeDataset
 
 dataset = AdaptiveContextGazeDataset(
     "metadata.parquet",
@@ -193,8 +139,9 @@ dataset = AdaptiveContextGazeDataset(
 ```
 
 ### 3. Memory Monitoring
+
 ```python
-from kaamba.utils.memory_monitor import MemoryMonitor
+from kaamba_repo.utils.memory_monitor import MemoryMonitor
 
 monitor = MemoryMonitor(log_dir="logs")
 
@@ -219,8 +166,9 @@ print(data.schema)
 ```
 
 ### 2. Test the DataLoader
+
 ```python
-from kaamba.utils.on_the_fly_dataset import create_on_the_fly_loader
+from kaamba_repo.utils.on_the_fly_dataset import create_on_the_fly_loader
 
 loader = create_on_the_fly_loader("metadata.parquet")
 
@@ -237,55 +185,6 @@ python -m kaamba.utils.memory_monitor
 
 # Shows recommended config for your hardware
 ```
-
-## Performance Expectations
-
-### For 100 participants with 1000 gaze samples each:
-
-**Preprocessing:**
-- Old: 4 hours (computing all sequences)
-- New: 5 minutes (just validation)
-- **Speedup: 48x**
-
-**Training (per epoch):**
-- Old: 2 hours (loading from 25GB files)
-- New: 30 minutes (fast I/O, parallel generation)
-- **Speedup: 4x**
-
-**Disk space:**
-- Old: 25 GB (pre-computed)
-- New: 500 MB (raw metadata only)
-- **Reduction: 50x**
-
-**RAM during training:**
-- Old: 16 GB peak
-- New: 4 GB peak
-- **Reduction: 4x**
-
-## Next Steps
-
-1. **Try Option A (1 minute)**
-   ```python
-   from kaamba.utils.on_the_fly_dataset import create_on_the_fly_loader
-   # Just replace your DataLoader!
-   ```
-
-2. **Convert your metadata to Parquet** (optional but faster)
-   ```python
-   from kaamba.utils.convert_dataset import convert_jsonl_to_parquet
-   convert_jsonl_to_parquet("metadata.jsonl", "metadata.parquet")
-   ```
-
-3. **Run training with monitoring**
-   ```bash
-   python kaamba/train_quick_start.py
-   ```
-
-4. **Experiment with context_len**
-   ```python
-   # No need to reprocess! Just change one number:
-   loader = create_on_the_fly_loader(..., context_len=64)
-   ```
 
 ## Troubleshooting
 
@@ -309,23 +208,3 @@ python -m kaamba.utils.memory_monitor
 - Use Parquet format instead of JSONL
 
 ## Summary
-
-You now have a **production-ready solution** for large eyetracking datasets:
-
-✅ **On-the-fly sequence generation** - No pre-computation  
-✅ **Memory efficient** - Only stores raw data once  
-✅ **Fast** - 4x faster training, 48x faster preprocessing  
-✅ **Flexible** - Change context_len anytime  
-✅ **Scalable** - Parallel generation with multiple workers  
-✅ **Monitored** - Built-in memory tracking  
-
-## Questions?
-
-Check the documentation files:
-- `ON_THE_FLY_GUIDE.md` - Detailed explanation
-- `VISUAL_COMPARISON.md` - Visual diagrams
-- `IMPLEMENTATION_GUIDE.md` - Step-by-step guide
-- `train_quick_start.py` - Example code with comments
-
-**Ready to train? Just pick an option and go!** 🚀
-

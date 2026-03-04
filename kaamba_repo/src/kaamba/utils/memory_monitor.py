@@ -179,8 +179,8 @@ def get_optimal_config(
         "available_vram_gb": available_vram_gb,
     }
 
+def get_summary() -> str:
 
-if __name__ == "__main__":
     # Example usage
     print("=" * 60)
     print("Memory Configuration Recommendation")
@@ -195,22 +195,24 @@ if __name__ == "__main__":
     print("Memory Usage Estimates")
     print("=" * 60)
 
-    for batch_size in [8, 16, 32, 64]:
+    for batch_size in [32, 64, 128, 256]:
         stats = estimate_batch_memory(batch_size=batch_size)
         print(f"Batch size {batch_size:3d}: {stats['batch_mb']:.1f} MB")
 
     print("\nExample usage in training:")
     print("""
-    monitor = MemoryMonitor(log_dir="logs")
-    
-    for epoch in range(num_epochs):
-        for step, batch in enumerate(loader):
-            with memory_tracker("forward_pass"):
-                loss = model(batch)
-            
-            if step % 100 == 0:
-                monitor.log_memory(step, "training")
-        
-        monitor.save_log()
-    """)
+       monitor = MemoryMonitor(log_dir="logs")
 
+       for epoch in range(num_epochs):
+           for step, batch in enumerate(loader):
+               with memory_tracker("forward_pass"):
+                   loss = model(batch)
+
+               if step % 100 == 0:
+                   monitor.log_memory(step, "training")
+
+           monitor.save_log()
+       """)
+
+if __name__ == "__main__":
+    get_summary()

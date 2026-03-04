@@ -7,7 +7,6 @@ def _create_stimuli_dataframe(img_with_paths: str, n_pages = 23) -> pl.DataFrame
 
     text_cols = [f"page_{i + 1}" for i in range(n_pages)]
     img_cols = [f"page_{i + 1}_img_file" for i in range(n_pages)]
-    # stimulus_cols = np.array([[1]*n_pages, [2]*n_pages, [3]*n_pages, [4]*n_pages, [6]*n_pages, [7]*n_pages, [8]*n_pages, [9]*n_pages, [10]*n_pages, [11]*n_pages, [12]*n_pages, [13]*n_pages]).flatten()
     stimulus_cols = np.array([1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13] * n_pages).flatten()
     # reshape pages
     pages_long = (
