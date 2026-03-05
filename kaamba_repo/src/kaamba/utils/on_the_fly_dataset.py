@@ -189,6 +189,7 @@ def create_on_the_fly_loader(
     stride: int = 1,
     dataset_type: str = "standard",
     max_image_size: int = 224,
+    image_folder_path: Optional[str] = None,
 ) -> DataLoader:
     """
     Create a DataLoader with on-the-fly sequence generation.
@@ -203,6 +204,8 @@ def create_on_the_fly_loader(
 
     Returns:
         DataLoader ready for training
+        :param image_folder_path:
+        :param max_image_size:
     """
 
     if dataset_type == "standard":
@@ -211,6 +214,7 @@ def create_on_the_fly_loader(
             context_len=context_len,
             stride=stride,
             max_image_size=max_image_size,
+            image_folder_path=image_folder_path,
         )
     elif dataset_type == "random_stride":
         dataset = RandomStridedGazeDataset(
