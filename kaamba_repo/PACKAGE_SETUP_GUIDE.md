@@ -13,7 +13,7 @@ Fixed the KAAMBA package to be a properly installable Python package with correc
   ```toml
   [tool.setuptools]
   package-dir = {"" = "src"}
-  
+
   [tool.setuptools.packages.find]
   where = ["src"]
   include = ["kaamba*"]
@@ -132,4 +132,3 @@ from kaamba import (
 - Empty directories (configs, pretrained_weights, logs) have placeholder `__init__.py` files
 - The package follows Python packaging best practices
 - Entry point script is configured: `kaamba = "kaamba.scripts.train_on_the_fly:main"`
-

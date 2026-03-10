@@ -14,15 +14,16 @@ from torch.utils.data import IterableDataset, DataLoader
 import numpy as np
 import polars as pl
 from pathlib import Path
-from typing import Iterator, Dict, Optional, Tuple
+from typing import Iterator, Dict, Optional
 
 from .constants import STIMULUS_FOLDER, SCREEN_RESOLUTION
 from torchvision.transforms import v2
 from torchvision.io import decode_image
 
+
 class MyCustomTransform(v2.Pad):
     def __init__(self, *args, **kwargs):
-        super().__init__(padding = 0, *args, **kwargs)
+        super().__init__(padding=0, *args, **kwargs)
 
     def forward(self, img):
         """
@@ -33,13 +34,9 @@ class MyCustomTransform(v2.Pad):
             PIL Image or Tensor: Padded image.
 
         """
-        print(
-            f"I'm transforming an image of shape {img.shape} "
-
-        )
+        print(f"I'm transforming an image of shape {img.shape} ")
         pad_vals = [0, 0, img.shape[2] - img.shape[2], img.shape[2] - img.shape[1]]
         return v2.functional.pad(img, pad_vals, self.fill, self.padding_mode)
-
 
 
 class OnTheFlyGazeDataset(IterableDataset):
@@ -53,8 +50,6 @@ class OnTheFlyGazeDataset(IterableDataset):
         Raw data (1000 gaze points) → generates ~967 sequences with context_len=32
         Memory: Only stores 1000 points once, not ~967k sequences
     """
-
-
 
     def __init__(
         self,
@@ -75,7 +70,7 @@ class OnTheFlyGazeDataset(IterableDataset):
         """
         self.metadata_path = Path(metadata_path)
         self.datacollection_name = self.metadata_path.stem.split("_")[-1]
-        print(self.datacollection_name) # Extract datacollection name from filename
+        print(self.datacollection_name)  # Extract datacollection name from filename
         self.context_len = context_len
         self.stride = stride
         self.lazy = lazy
@@ -87,9 +82,17 @@ class OnTheFlyGazeDataset(IterableDataset):
 
         # Load metadata lazily
         if self.metadata_path.suffix == ".parquet":
-            self.data = pl.scan_parquet(str(metadata_path)) if lazy else pl.read_parquet(str(metadata_path))
+            self.data = (
+                pl.scan_parquet(str(metadata_path))
+                if lazy
+                else pl.read_parquet(str(metadata_path))
+            )
         elif self.metadata_path.suffix in [".jsonl", ".ndjson"]:
-            self.data = pl.scan_ndjson(str(metadata_path)) if lazy else pl.read_ndjson(str(metadata_path))
+            self.data = (
+                pl.scan_ndjson(str(metadata_path))
+                if lazy
+                else pl.read_ndjson(str(metadata_path))
+            )
         else:
             raise ValueError(f"Unsupported format: {self.metadata_path.suffix}")
 
@@ -116,28 +119,35 @@ class OnTheFlyGazeDataset(IterableDataset):
         if self.max_image_size is not None:
             max_size = self.max_image_size
 
-        screen_resolution = SCREEN_RESOLUTION[self.datacollection_name]  # SCREEN_RESOLUTION[self.datacollection_name] # for example (1920, 1080)  # Example screen resolution, adjust as needed
+        screen_resolution = SCREEN_RESOLUTION[
+            self.datacollection_name
+        ]  # SCREEN_RESOLUTION[self.datacollection_name] # for example (1920, 1080)  # Example screen resolution, adjust as needed
         image = decode_image(str(image_path))
-        padding_val = [0, 0, screen_resolution[0] - image.shape[2], screen_resolution[1] - image.shape[1]]
+        padding_val = [
+            0,
+            0,
+            screen_resolution[0] - image.shape[2],
+            screen_resolution[1] - image.shape[1],
+        ]
         self.scaling_factor = max_size / screen_resolution[0]
-        transform = v2.Compose([
-            v2.Pad(padding=padding_val, padding_mode="edge"),
-            v2.Resize(size=None, max_size=max_size),
-            # ToDo just for testing purposes has to be adapted to the actual image size and model requirements max size
-            MyCustomTransform(padding_mode="edge"),
-            v2.ToDtype(torch.float32, scale=True),
-            v2.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-            # get normalized values for RGB channels (assuming image is in RGB format
-        ])
+        transform = v2.Compose(
+            [
+                v2.Pad(padding=padding_val, padding_mode="edge"),
+                v2.Resize(size=None, max_size=max_size),
+                # ToDo just for testing purposes has to be adapted to the actual image size and model requirements max size
+                MyCustomTransform(padding_mode="edge"),
+                v2.ToDtype(torch.float32, scale=True),
+                v2.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                # get normalized values for RGB channels (assuming image is in RGB format
+            ]
+        )
 
         return transform(image)
-
 
     def _text_transform(self, text: str) -> torch.Tensor:
         # Placeholder for text transformation (e.g., tokenization)
         # For now, we return an empty tensor since we don't have text data
         return torch.empty(0)
-
 
     def _generate_sequences(
         self,
@@ -154,31 +164,52 @@ class OnTheFlyGazeDataset(IterableDataset):
         Yields:
             Dict with input_seq, target_seq, stimulus image and metadata
         """
-        transformed_image = self._image_transform(self.metadata_path.parent/ row.get("file_name"))
+        transformed_image = self._image_transform(
+            self.metadata_path.parent / row.get("file_name")
+        )
         # Generate sequences with specified stride
         for i in range(0, len(gaze_data) - self.context_len, self.stride):
             # Extract input and target sequences
-            input_gaze = gaze_data[i:i + self.context_len]
-            target_gaze = gaze_data[i + 1:i + self.context_len + 1]
+            input_gaze = gaze_data[i : i + self.context_len]
+            target_gaze = gaze_data[i + 1 : i + self.context_len + 1]
 
             # Convert to numpy arrays
             input_seq = np.array(
-                [[g["pixel_x"] * self.scaling_factor  if type(g["pixel_x"]) is float else 0, g["pixel_y"] * self.scaling_factor  if g["pixel_y"] is not None else 0] for g in input_gaze],
-                dtype=np.float32
+                [
+                    [
+                        g["pixel_x"] * self.scaling_factor
+                        if type(g["pixel_x"]) is float
+                        else 0,
+                        g["pixel_y"] * self.scaling_factor
+                        if g["pixel_y"] is not None
+                        else 0,
+                    ]
+                    for g in input_gaze
+                ],
+                dtype=np.float32,
             )
             target_seq = np.array(
-                [[g["pixel_x"] * self.scaling_factor  if g["pixel_x"] is not None else 0, g["pixel_y"] * self.scaling_factor  if g["pixel_y"] is not None else 0] for g in target_gaze],
-                dtype=np.float32
+                [
+                    [
+                        g["pixel_x"] * self.scaling_factor
+                        if g["pixel_x"] is not None
+                        else 0,
+                        g["pixel_y"] * self.scaling_factor
+                        if g["pixel_y"] is not None
+                        else 0,
+                    ]
+                    for g in target_gaze
+                ],
+                dtype=np.float32,
             )
 
             yield {
                 "input_seq": torch.from_numpy(input_seq),
                 "target_seq": torch.from_numpy(target_seq),
-                #"participant_id": row.get("participant_id"),
-                #"stimulus_id": row.get("stimulus_id"),
+                # "participant_id": row.get("participant_id"),
+                # "stimulus_id": row.get("stimulus_id"),
                 "image": transformed_image,
             }
-
 
 
 def create_on_the_fly_loader(
@@ -216,17 +247,17 @@ def create_on_the_fly_loader(
             max_image_size=max_image_size,
             image_folder_path=image_folder_path,
         )
-    elif dataset_type == "random_stride":
-        dataset = RandomStridedGazeDataset(
-            metadata_path,
-            context_len=context_len,
-        )
-    elif dataset_type == "adaptive":
-        dataset = AdaptiveContextGazeDataset(
-            metadata_path,
-            min_context_len=max(16, context_len // 2),
-            max_context_len=context_len * 2,
-        )
+    # elif dataset_type == "random_stride":
+    #     dataset = RandomStridedGazeDataset(
+    #         metadata_path,
+    #         context_len=context_len,
+    #     )
+    # elif dataset_type == "adaptive":
+    #     dataset = AdaptiveContextGazeDataset(
+    #         metadata_path,
+    #         min_context_len=max(16, context_len // 2),
+    #         max_context_len=context_len * 2,
+    #     )
     else:
         raise ValueError(f"Unknown dataset type: {dataset_type}")
 
@@ -244,8 +275,11 @@ if __name__ == "__main__":
     print("=" * 60)
     print("On-the-Fly Sequence Generation Example")
     print("=" * 60)
-    path = STIMULUS_FOLDER / "Goettingen" / "metadata_Goettingen.parquet"  # Adjust path as needed
+    path = (
+        STIMULUS_FOLDER / "Goettingen" / "metadata_Goettingen.parquet"
+    )  # Adjust path as needed
     import os
+
     print(os.path.exists(path))  # Check if file exists
     # Create loader
     loader = create_on_the_fly_loader(
@@ -271,4 +305,3 @@ if __name__ == "__main__":
         # This is what you'd do in training:
         # output = model(batch['input_seq'])
         # loss = criterion(output, batch['target_seq'])
-

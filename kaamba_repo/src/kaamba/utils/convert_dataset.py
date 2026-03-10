@@ -8,7 +8,6 @@ from pathlib import Path
 
 import time
 from datasets import DatasetBuilder, DatasetInfo, Features, Array2D, Sequence, Value
-from pathlib import Path
 import os
 
 
@@ -49,7 +48,7 @@ def convert_jsonl_to_parquet(
     # Show file size comparison
     input_size = Path(input_path).stat().st_size / (1024**3)
     output_size = Path(output_path).stat().st_size / (1024**3)
-    ratio = (1 - output_size/input_size) * 100
+    ratio = (1 - output_size / input_size) * 100
 
     print(f"  Size: {input_size:.2f}GB → {output_size:.2f}GB ({ratio:.1f}% reduction)")
 
@@ -123,9 +122,6 @@ def create_hf_dataset_config(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Create dataset.py script
-    dataset_script = ''''''
-
 
 class CustomGazeDataset(DatasetBuilder):
     VERSION = "1.0.0"
@@ -134,17 +130,21 @@ class CustomGazeDataset(DatasetBuilder):
 
     def _info(self):
         return DatasetInfo(
-            features=Features({
-                "input_seq": Sequence(Array2D((None, 2), dtype="float32")),
-                "target_seq": Sequence(Array2D((None, 2), dtype="float32")),
-                "participant_id": Value("string"),
-                "stimulus_id": Value("string"),
-            })
+            features=Features(
+                {
+                    "input_seq": Sequence(Array2D((None, 2), dtype="float32")),
+                    "target_seq": Sequence(Array2D((None, 2), dtype="float32")),
+                    "participant_id": Value("string"),
+                    "stimulus_id": Value("string"),
+                }
+            )
         )
 
     def _split_generators(self, dl_manager):
         # Auto-detect shard files
-        data_dir = os.path.dirname(self.config.data_files) if self.config.data_files else "."
+        data_dir = (
+            os.path.dirname(self.config.data_files) if self.config.data_files else "."
+        )
         shard_files = sorted(Path(data_dir).glob("shard-*.parquet"))
         return [
             {
@@ -159,13 +159,14 @@ class CustomGazeDataset(DatasetBuilder):
             for idx, row in enumerate(data.iter_rows(named=True)):
                 yield f"{shard_idx}_{idx}", row
 
-
     # Create README
-readme = f'''# Eyetracking Dataset
+
+
+readme = """# Eyetracking Dataset
 
 This is a sharded eyetracking dataset optimized for streaming.
 
-## Format   
+## Format
 - Format: Parquet (columnar, compressed)
 - Shards: Multiple files for parallel loading
 - Compression: Snappy
@@ -211,7 +212,8 @@ loader = DataLoader(dataset, batch_size=32, num_workers=4)
         f.write(readme)
 
     print(f"✓ Configuration created: config_file")
-'''
+"""
+
 
 def estimate_memory_usage(
     input_path: str,
@@ -261,16 +263,14 @@ def estimate_memory_usage(
 if __name__ == "__main__":
     # Example: Convert and shard your dataset
     from constants import STIMULUS_FOLDER
+
     input_file = str(STIMULUS_FOLDER / "Goettingen/metadata_Goettingen.jsonl")
 
     # Step 1: Convert JSONL to Parquet
     print("=" * 60)
     print("STEP 1: Convert JSONL to Parquet")
     print("=" * 60)
-    convert_jsonl_to_parquet(
-        input_file,
-        input_file.replace(".jsonl", ".parquet")
-    )
+    convert_jsonl_to_parquet(input_file, input_file.replace(".jsonl", ".parquet"))
 
     # Step 2: Shard the dataset
     print("\n" + "=" * 60)
@@ -289,4 +289,4 @@ if __name__ == "__main__":
     estimates = estimate_memory_usage(input_file)
     print(f"Total dataset: {estimates['total_dataset_gb']:.2f} GB")
     print(f"Per-batch memory: {estimates['batch_memory_mb']:.2f} MB")
-
+    create_hf_dataset_config(Path(input_file).stem())
