@@ -16,7 +16,9 @@ import polars as pl
 from pathlib import Path
 from typing import Iterator, Dict, Optional
 
-from .constants import STIMULUS_FOLDER, SCREEN_RESOLUTION
+import pymovements as pm
+
+from kaamba.utils.constants import STIMULUS_FOLDER, SCREEN_RESOLUTION
 from torchvision.transforms import v2
 from torchvision.io import decode_image
 
@@ -34,7 +36,7 @@ class MyCustomTransform(v2.Pad):
             PIL Image or Tensor: Padded image.
 
         """
-        print(f"I'm transforming an image of shape {img.shape} ")
+        # print(f"I'm transforming an image of shape {img.shape} ")
         pad_vals = [0, 0, img.shape[2] - img.shape[2], img.shape[2] - img.shape[1]]
         return v2.functional.pad(img, pad_vals, self.fill, self.padding_mode)
 
@@ -212,8 +214,176 @@ class OnTheFlyGazeDataset(IterableDataset):
             }
 
 
+class PymovementsOnTheFlyGazeDataset(IterableDataset):
+    """
+    Dataset that generates gaze sequences on-the-fly using pymovements datasets.
+
+    Loads stimuli and gazeframes from pymovements, generates sequences during iteration.
+    """
+
+    def __init__(
+        self,
+        dataset_name: str,
+        context_len: int = 32,
+        stride: int = 1,
+        max_image_size: int = 512,
+        root: str = "data/",
+        subset: Optional[Dict] = None,
+    ):
+        """
+        Args:
+            dataset_name: Name of the pymovements dataset (e.g., 'GGTG', 'MultiplEYE_DE_DE_Goettingen_1_2026')
+            context_len: Length of input sequence
+            stride: Step between sequences
+            max_image_size: Max size for image resizing
+            root: Root directory for dataset
+            subset: Subset to load (e.g., {"subject_id": ["P01"]})
+        """
+        self.dataset_name = dataset_name
+        self.context_len = context_len
+        self.stride = stride
+        self.max_image_size = max_image_size
+
+        # Load pymovements dataset
+        dataset_paths = pm.DatasetPaths(root=root)
+
+        self.pm_dataset = pm.Dataset(dataset_name, path=dataset_paths)
+
+        self.pm_dataset.load(subset=subset)
+        # Build screen resolutions dict per subject
+        self.screen_resolutions = {}
+        for gaze in self.pm_dataset.gaze:
+            subject_id = gaze.metadata["subject_id"]
+            self.screen_resolutions[subject_id] = (
+                gaze.experiment.screen.width_px,
+                gaze.experiment.screen.height_px,
+            )
+
+        # Concatenate all gaze frames into a single polars dataframe
+        self.gazeframes = pl.concat(
+            [
+                gaze.samples.with_columns(
+                    pl.lit(gaze.metadata["subject_id"]).alias("subject_id")
+                )
+                for gaze in self.pm_dataset.gaze
+            ]
+        )
+        # Convert stimuli to polars
+        self.stimuli = self.pm_dataset.fileinfo["ImageStimulus"]
+
+    def __iter__(self) -> Iterator[Dict]:
+        """
+        Iterate over the dataset, yielding sequences from pymovements data.
+        """
+        # Group gazeframes by subject_id and stimulus
+        grouped = self.gazeframes.group_by(["subject_id", "stimulus"])
+
+        for group_key, group in grouped:
+            subject_id, stimulus = group_key
+            # Get screen resolution for this subject
+            screen_width_px, screen_height_px = self.screen_resolutions[subject_id]
+            self.scaling_factor = self.max_image_size / screen_width_px
+
+            # Convert group to list of dicts, assuming 'pixel' column contains [x, y] lists
+            gaze_data = group.select("pixel")
+
+            # Skip if not enough data
+            if len(gaze_data) < self.context_len + 1:
+                continue
+
+            # Get stimulus info, assuming 'filename' matches 'stimulus'
+            stimulus_row = self.stimuli.filter(pl.col("stimulus") == stimulus)
+            if stimulus_row.is_empty():
+                continue
+            image_path = Path(
+                self.pm_dataset.paths.stimuli / stimulus_row["filepath"][0]
+            )
+
+            # Transform image with subject's screen resolution
+            transformed_image = self._image_transform(
+                image_path, screen_width_px, screen_height_px
+            )
+
+            # Generate sequences
+            yield from self._generate_sequences(gaze_data, transformed_image)
+
+    def _image_transform(
+        self, image_path: Path, screen_width_px: int, screen_height_px: int
+    ) -> torch.Tensor:
+        image = decode_image(str(image_path))
+
+        padding_val = [
+            0,
+            0,
+            screen_width_px - image.shape[2],
+            screen_height_px - image.shape[1],
+        ]
+        transform = v2.Compose(
+            [
+                v2.Pad(padding=padding_val, padding_mode="edge"),
+                v2.Resize(size=None, max_size=self.max_image_size),
+                MyCustomTransform(padding_mode="edge"),
+                v2.ToDtype(torch.float32, scale=True),
+                v2.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
+        )
+        return transform(image)
+
+    def _generate_sequences(
+        self, gaze_data: list, transformed_image: torch.Tensor
+    ) -> Iterator[Dict]:
+        for i in range(0, len(gaze_data) - self.context_len, self.stride):
+            gaze_data = gaze_data.with_columns(
+                pl.col("pixel")
+                .fill_null(pl.lit([0.0, 0.0]))  # case: whole list = null
+                .list.eval(
+                    pl.element().fill_null(0.0)
+                )  # case: elements inside list null
+                .alias("pixel")
+            )  # Ensure no nulls in 'pixel' column, fill with [0.0, 0.0] if null, and fill nulls inside lists with 0.0
+            input_gaze = gaze_data[i : i + self.context_len]
+            target_gaze = gaze_data[i + 1 : i + self.context_len + 1]
+
+            input_seq = (
+                np.array(
+                    [
+                        [
+                            g.list.get(0) * self.scaling_factor,
+                            g.list.get(1) * self.scaling_factor,
+                        ]
+                        for g in input_gaze
+                    ],
+                    dtype=np.float32,
+                )
+                .squeeze()
+                .T
+            )
+
+            target_seq = (
+                np.array(
+                    [
+                        [
+                            g.list.get(0) * self.scaling_factor,
+                            g.list.get(1) * self.scaling_factor,
+                        ]
+                        for g in target_gaze
+                    ],
+                    dtype=np.float32,
+                )
+                .squeeze()
+                .T
+            )
+
+            yield {
+                "input_seq": torch.from_numpy(input_seq),
+                "target_seq": torch.from_numpy(target_seq),
+                "image": transformed_image,
+            }
+
+
 def create_on_the_fly_loader(
-    metadata_path: str,
+    metadata_path: Optional[str] = None,
+    dataset_name: Optional[str] = None,
     batch_size: int = 32,
     num_workers: int = 4,
     context_len: int = 32,
@@ -221,45 +391,56 @@ def create_on_the_fly_loader(
     dataset_type: str = "standard",
     max_image_size: int = 224,
     image_folder_path: Optional[str] = None,
+    root: str = "data/",
+    subset: Optional[Dict] = None,
 ) -> DataLoader:
     """
     Create a DataLoader with on-the-fly sequence generation.
 
     Args:
-        metadata_path: Path to metadata
+        metadata_path: Path to metadata (for original dataset)
+        dataset_name: Name of pymovements dataset (for pymovements dataset)
         batch_size: Batch size
         num_workers: Number of workers for parallel loading
         context_len: Sequence length
         stride: Step between sequences
         dataset_type: "standard", "random_stride", or "adaptive"
+        max_image_size: Max size for image resizing
+        image_folder_path: Folder for images (original)
+        root: Root for pymovements
+        subset: Subset for pymovements
 
     Returns:
         DataLoader ready for training
-        :param image_folder_path:
-        :param max_image_size:
     """
 
-    if dataset_type == "standard":
-        dataset = OnTheFlyGazeDataset(
-            metadata_path,
-            context_len=context_len,
-            stride=stride,
-            max_image_size=max_image_size,
-            image_folder_path=image_folder_path,
-        )
-    # elif dataset_type == "random_stride":
-    #     dataset = RandomStridedGazeDataset(
-    #         metadata_path,
-    #         context_len=context_len,
-    #     )
-    # elif dataset_type == "adaptive":
-    #     dataset = AdaptiveContextGazeDataset(
-    #         metadata_path,
-    #         min_context_len=max(16, context_len // 2),
-    #         max_context_len=context_len * 2,
-    #     )
+    if dataset_name is not None:
+        # Use pymovements dataset
+        if dataset_type == "standard":
+            dataset = PymovementsOnTheFlyGazeDataset(
+                dataset_name,
+                context_len=context_len,
+                stride=stride,
+                max_image_size=max_image_size,
+                root=root,
+                subset=subset,
+            )
+        else:
+            raise ValueError(f"Unknown dataset type: {dataset_type}")
+    elif metadata_path is not None:
+        # Use original dataset
+        if dataset_type == "standard":
+            dataset = OnTheFlyGazeDataset(
+                metadata_path,
+                context_len=context_len,
+                stride=stride,
+                max_image_size=max_image_size,
+                image_folder_path=image_folder_path,
+            )
+        else:
+            raise ValueError(f"Unknown dataset type: {dataset_type}")
     else:
-        raise ValueError(f"Unknown dataset type: {dataset_type}")
+        raise ValueError("Either metadata_path or dataset_name must be provided")
 
     return DataLoader(
         dataset,
@@ -283,13 +464,21 @@ if __name__ == "__main__":
     print(os.path.exists(path))  # Check if file exists
     # Create loader
     loader = create_on_the_fly_loader(
-        path,  # or "metadata.jsonl"
+        dataset_name="GGTG",
+        subset={"subject_id": ["P01"]},  # Optional: load specific subjects
         batch_size=32,
-        num_workers=4,
-        context_len=40,
-        stride=10,
-        dataset_type="standard",
+        context_len=32,
+        stride=1,
+        max_image_size=512,
+        root="C:/Users/saphi/PycharmProjects/thesis/data",
     )
+
+    # loader = create_on_the_fly_loader(
+    #    metadata_path="path/to/metadata.parquet",
+    #    batch_size=32,
+    #    context_len=32,
+    #    stride=1
+    # )
 
     # Iterate - sequences generated on-demand
     print("\nIterating over batches (sequences generated on-the-fly):")

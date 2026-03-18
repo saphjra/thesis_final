@@ -24,3 +24,6 @@ dependencies = ["mamba", "torch", "torchvision", "torchaudio"]
 mamba = [{ requirement = "torch", match-runtime = true }]
 torchvision = [{ requirement = "torch", match-runtime = true }]
 torchaudio = [{ requirement = "torch", match-runtime = true }]
+
+#command for remote server sync:
+ C:\Users\saphi> scp -r .\PycharmProjects\thesis\remote\ tars:~/thesis/
