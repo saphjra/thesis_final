@@ -229,6 +229,7 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
         max_image_size: int = 512,
         root: str = "data/",
         subset: Optional[Dict] = None,
+        **kwargs,
     ):
         """
         Args:
@@ -238,6 +239,15 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
             max_image_size: Max size for image resizing
             root: Root directory for dataset
             subset: Subset to load (e.g., {"subject_id": ["P01"]})
+
+        creates a gazeframe with the following schema:
+            subject_id: int
+            stimulus: str
+            pixel: list[float] (x, y)
+            also additionally the follwoing inforamtion is kept:
+            timestamp: int
+            dataset dependent metadata (e.g. round_id, session_id for GazeBase)
+
         """
         self.dataset_name = dataset_name
         self.context_len = context_len
@@ -258,16 +268,30 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
                 gaze.experiment.screen.width_px,
                 gaze.experiment.screen.height_px,
             )
+        if dataset_name == "GazeBase":
+            self.gazeframes = pl.concat(
+                [
+                    gaze.samples.with_columns(
+                        pl.lit(gaze.metadata["subject_id"]).alias("subject_id"),
+                        pl.lit(
+                            f"R{gaze.metadata['round_id']}S{gaze.metadata['session_id']}"
+                        ).alias("stimulus"),
+                    )
+                    for gaze in self.pm_dataset.gaze
+                ]
+            )
+            self.gazeframes = self.gazeframes.rename({"position": "pixel"})
 
         # Concatenate all gaze frames into a single polars dataframe
-        self.gazeframes = pl.concat(
-            [
-                gaze.samples.with_columns(
-                    pl.lit(gaze.metadata["subject_id"]).alias("subject_id")
-                )
-                for gaze in self.pm_dataset.gaze
-            ]
-        )
+        else:
+            self.gazeframes = pl.concat(
+                [
+                    gaze.samples.with_columns(
+                        pl.lit(gaze.metadata["subject_id"]).alias("subject_id")
+                    )
+                    for gaze in self.pm_dataset.gaze
+                ]
+            )
         # Convert stimuli to polars
         self.stimuli = self.pm_dataset.fileinfo["ImageStimulus"]
 
@@ -310,7 +334,8 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
     def _image_transform(
         self, image_path: Path, screen_width_px: int, screen_height_px: int
     ) -> torch.Tensor:
-        image = decode_image(str(image_path))
+        image = decode_image(str(image_path), mode="RGB")
+        assert image.shape == (3, screen_height_px, screen_width_px)
 
         padding_val = [
             0,
@@ -332,17 +357,16 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
     def _generate_sequences(
         self, gaze_data: list, transformed_image: torch.Tensor
     ) -> Iterator[Dict]:
-        for i in range(0, len(gaze_data) - self.context_len, self.stride):
-            gaze_data = gaze_data.with_columns(
-                pl.col("pixel")
-                .fill_null(pl.lit([0.0, 0.0]))  # case: whole list = null
-                .list.eval(
-                    pl.element().fill_null(0.0)
-                )  # case: elements inside list null
-                .alias("pixel")
-            )  # Ensure no nulls in 'pixel' column, fill with [0.0, 0.0] if null, and fill nulls inside lists with 0.0
-            input_gaze = gaze_data[i : i + self.context_len]
-            target_gaze = gaze_data[i + 1 : i + self.context_len + 1]
+        # Ensure no nulls in 'pixel' column, fill with [0.0, 0.0] if null, and fill nulls inside lists with 0.0
+        gaze_data_cleaned = gaze_data.with_columns(
+            pl.col("pixel")
+            .fill_null(pl.lit([0.0, 0.0]))  # case: whole list = null
+            .list.eval(pl.element().fill_null(0.0))  # case: elements inside list null
+            .alias("pixel")
+        )
+        for i in range(0, len(gaze_data_cleaned) - self.context_len, self.stride):
+            input_gaze = gaze_data_cleaned[i : i + self.context_len]
+            target_gaze = gaze_data_cleaned[i + 1 : i + self.context_len + 1]
 
             input_seq = (
                 np.array(
@@ -464,8 +488,12 @@ if __name__ == "__main__":
     print(os.path.exists(path))  # Check if file exists
     # Create loader
     loader = create_on_the_fly_loader(
-        dataset_name="GGTG",
-        subset={"subject_id": ["P01"]},  # Optional: load specific subjects
+        dataset_name="GazeBase",
+        subset={
+            "subject_id": [288],
+            "round_id": [1],
+            "task_name": ["TEX"],
+        },  # Optional: load specific subjects
         batch_size=32,
         context_len=32,
         stride=1,
