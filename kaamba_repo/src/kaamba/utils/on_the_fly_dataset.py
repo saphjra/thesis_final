@@ -18,7 +18,7 @@ from typing import Iterator, Dict, Optional
 
 import pymovements as pm
 
-from kaamba.utils.constants import STIMULUS_FOLDER, SCREEN_RESOLUTION
+from kaamba.utils.constants import SCREEN_RESOLUTION
 from torchvision.transforms import v2
 from torchvision.io import decode_image
 
@@ -480,15 +480,11 @@ if __name__ == "__main__":
     print("=" * 60)
     print("On-the-Fly Sequence Generation Example")
     print("=" * 60)
-    path = (
-        STIMULUS_FOLDER / "Goettingen" / "metadata_Goettingen.parquet"
-    )  # Adjust path as needed
-    import os
 
-    print(os.path.exists(path))  # Check if file exists
     # Create loader
     loader = create_on_the_fly_loader(
         dataset_name="GazeBase",
+        # metadata_path="C:/Users/saphi/PycharmProjects/thesis/kaamba_repo/kaamba_dataset/stimuli/Goettingen/metadata_Goettingen.parquet",
         subset={
             "subject_id": [288],
             "round_id": [1],
