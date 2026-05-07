@@ -71,8 +71,9 @@ class OnTheFlyGazeDataset(IterableDataset):
             lazy: Use Polars lazy evaluation (recommended for large datasets)
         """
         self.metadata_path = Path(metadata_path)
-        self.datacollection_name = self.metadata_path.stem.split("_")[-1]
-        print(self.datacollection_name)  # Extract datacollection name from filename
+        self.datacollection_name = self.metadata_path.stem.split("_")[
+            -1
+        ]  # Extract datacollection name from filename
         self.context_len = context_len
         self.stride = stride
         self.lazy = lazy
@@ -235,7 +236,7 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
         Args:
             dataset_name: Name of the pymovements dataset (e.g., 'GGTG', 'MultiplEYE_DE_DE_Goettingen_1_2026')
             context_len: Length of input sequence
-            stride: Step between sequences
+            stride: Step between timesteps, e.g. a way to downsample the raw data
             max_image_size: Max size for image resizing
             root: Root directory for dataset
             subset: Subset to load (e.g., {"subject_id": ["P01"]})
@@ -268,6 +269,9 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
                 gaze.experiment.screen.width_px,
                 gaze.experiment.screen.height_px,
             )
+
+        # add subject id and stimulus to the gaze dataframe for further processing
+
         if dataset_name == "GazeBase":
             self.gazeframes = pl.concat(
                 [
@@ -280,7 +284,20 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
                     for gaze in self.pm_dataset.gaze
                 ]
             )
+            self.gazeframes.head()
             self.gazeframes = self.gazeframes.rename({"position": "pixel"})
+
+        elif dataset_name == "mcfw-gaze":
+            self.gazeframes = pl.concat(
+                [
+                    gaze.samples.with_columns(
+                        pl.lit(gaze.metadata["subject_id"]).alias("subject_id"),
+                        pl.lit(gaze.metadata["stimulus"]).alias("stimulus"),
+                        # pl.lit(gaze.metadata["trial_id"]).alias("trial_id"),
+                    )
+                    for gaze in self.pm_dataset.gaze
+                ]
+            )
 
         # Concatenate all gaze frames into a single polars dataframe
         else:
@@ -299,10 +316,12 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
         """
         Iterate over the dataset, yielding sequences from pymovements data.
         """
-        # Group gazeframes by subject_id and stimulus
+        # Materialize groups into a list to avoid Polars multiprocessing deadlock
+        # This converts the GroupBy iterator to a concrete list before iterating
         grouped = self.gazeframes.group_by(["subject_id", "stimulus"])
+        groups = [(group_key, group) for group_key, group in grouped]
 
-        for group_key, group in grouped:
+        for group_key, group in groups:
             subject_id, stimulus = group_key
             # Get screen resolution for this subject
             screen_width_px, screen_height_px = self.screen_resolutions[subject_id]
@@ -324,16 +343,22 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
             )
 
             # Transform image with subject's screen resolution
-            transformed_image = self._image_transform(
-                image_path, screen_width_px, screen_height_px
-            )
+            transformed_image = self._image_transform(image_path)
 
             # Generate sequences
             yield from self._generate_sequences(gaze_data, transformed_image)
 
-    def _image_transform(
+    def _image_transform_coordiantes_preserving(
         self, image_path: Path, screen_width_px: int, screen_height_px: int
     ) -> torch.Tensor:
+        """this function could be used in an architecture where the model needs to preserve
+        the original coordinates of the gaze data, for example if the model uses a spatial attention mechanism or a
+        SSM with a mechanism resembling cross attention implements that
+        directly attends to pixel locations in the image. In this case, we need to ensure that the image is padded to
+        the original screen resolution, so that the gaze coordinates still correspond to the correct locations
+        in the image. The padding is done using edge values, which means that the original image content is preserved
+        and not distorted by resizing. This way, the model can learn to attend to the correct regions of the image based
+        on the gaze data, without any misalignment caused by resizing."""
         image = decode_image(str(image_path), mode="RGB")
         assert image.shape == (3, screen_height_px, screen_width_px)
 
@@ -354,16 +379,41 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
         )
         return transform(image)
 
+    def _image_transform(self, image_path: Path) -> torch.Tensor:
+        """this function is used in the version where a global image embedding is extracted and fed into the model,
+        for example in a ViT-based architecture. In this case, we can simply resize the image to the desired max size,
+        without worrying about preserving the original coordinates of the gaze data.
+        The resizing is done while maintaining the aspect ratio, so that the image content is not distorted.
+        This way, the model can learn to extract relevant features from the image based on the gaze data,
+        without any misalignment caused by resizing."""
+
+        image = decode_image(str(image_path), mode="RGB")
+
+        transform = v2.Compose(
+            [
+                v2.Resize(size=None, max_size=self.max_image_size),
+                v2.ToDtype(torch.float32, scale=True),
+                v2.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
+        )
+        return transform(image)
+
     def _generate_sequences(
         self, gaze_data: list, transformed_image: torch.Tensor
     ) -> Iterator[Dict]:
+        """function to generate sequences from pymovements data.
+        filling the pixel null values with 0.0 to keep the information about data loss in the gaze data,
+        to let the model learn to handle missing data.
+        Could also be filtered"""
         # Ensure no nulls in 'pixel' column, fill with [0.0, 0.0] if null, and fill nulls inside lists with 0.0
+
         gaze_data_cleaned = gaze_data.with_columns(
             pl.col("pixel")
             .fill_null(pl.lit([0.0, 0.0]))  # case: whole list = null
             .list.eval(pl.element().fill_null(0.0))  # case: elements inside list null
             .alias("pixel")
         )
+
         for i in range(0, len(gaze_data_cleaned) - self.context_len, self.stride):
             input_gaze = gaze_data_cleaned[i : i + self.context_len]
             target_gaze = gaze_data_cleaned[i + 1 : i + self.context_len + 1]
@@ -409,7 +459,7 @@ def create_on_the_fly_loader(
     metadata_path: Optional[str] = None,
     dataset_name: Optional[str] = None,
     batch_size: int = 32,
-    num_workers: int = 4,
+    num_workers: int = 0,
     context_len: int = 32,
     stride: int = 1,
     dataset_type: str = "standard",
@@ -466,13 +516,17 @@ def create_on_the_fly_loader(
     else:
         raise ValueError("Either metadata_path or dataset_name must be provided")
 
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        pin_memory=True,
-        prefetch_factor=2,
-    )
+    # prefetch_factor can only be used with num_workers > 0
+    dataloader_kwargs = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": True,
+    }
+
+    if num_workers > 0:
+        dataloader_kwargs["prefetch_factor"] = 2
+
+    return DataLoader(dataset, **dataloader_kwargs)
 
 
 if __name__ == "__main__":
@@ -481,22 +535,36 @@ if __name__ == "__main__":
     print("On-the-Fly Sequence Generation Example")
     print("=" * 60)
 
+    # # Create loader
+    # loader_gazebase = create_on_the_fly_loader(
+    #     dataset_name="GazeBase",
+    #     #metadata_path="C:/Users/saphi/PycharmProjects/thesis/kaamba_repo/kaamba_dataset/stimuli/Goettingen/metadata_Goettingen.parquet",
+    #     subset={
+    #         "subject_id": [288],
+    #         "round_id": [1],
+    #         "task_name": ["TEX"],
+    #     },  # Optional: load specific subjects
+    #     batch_size=32,
+    #     context_len=32,
+    #     stride=1,
+    #     max_image_size=512,
+    #     root="/home/janhof/thesis/data/",
+    # )
     # Create loader
     loader = create_on_the_fly_loader(
-        dataset_name="GazeBase",
+        dataset_name="mcfw-gaze",
         # metadata_path="C:/Users/saphi/PycharmProjects/thesis/kaamba_repo/kaamba_dataset/stimuli/Goettingen/metadata_Goettingen.parquet",
         subset={
-            "subject_id": [288],
-            "round_id": [1],
-            "task_name": ["TEX"],
+            "subject_id": ["001"],
+            "trial_id": ["1"],
+            "stimulus": ["43"],
         },  # Optional: load specific subjects
         batch_size=32,
         context_len=32,
         stride=1,
         max_image_size=512,
-        root="C:/Users/saphi/PycharmProjects/thesis/data",
+        root="/home/janhof/thesis/data/",
     )
-
     # loader = create_on_the_fly_loader(
     #    metadata_path="path/to/metadata.parquet",
     #    batch_size=32,
