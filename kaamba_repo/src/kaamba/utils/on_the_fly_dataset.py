@@ -15,10 +15,10 @@ import numpy as np
 import polars as pl
 from pathlib import Path
 from typing import Iterator, Dict, Optional
-
+import os
 import pymovements as pm
+from tqdm import tqdm
 
-from kaamba.utils.constants import SCREEN_RESOLUTION
 from torchvision.transforms import v2
 from torchvision.io import decode_image
 
@@ -41,180 +41,6 @@ class MyCustomTransform(v2.Pad):
         return v2.functional.pad(img, pad_vals, self.fill, self.padding_mode)
 
 
-class OnTheFlyGazeDataset(IterableDataset):
-    """
-    Dataset that generates gaze sequences on-the-fly.
-
-    Instead of pre-computing all sequences, this generates them during iteration.
-    Raw gaze data is stored once, sequences are created as needed.
-
-    Example:
-        Raw data (1000 gaze points) → generates ~967 sequences with context_len=32
-        Memory: Only stores 1000 points once, not ~967k sequences
-    """
-
-    def __init__(
-        self,
-        metadata_path: str,
-        context_len: int = 32,
-        stride: int = 1,
-        lazy: bool = True,
-        max_image_size: int = 512,
-        image_folder_path: Optional[str] = None,
-    ):
-        """
-        Args:
-            metadata_path: Path to metadata file (parquet or jsonl)
-                          Should contain 'data' field with list of gaze dicts
-            context_len: Length of input sequence
-            stride: Step between sequences (1 = all sequences, 2 = skip every other)
-            lazy: Use Polars lazy evaluation (recommended for large datasets)
-        """
-        self.metadata_path = Path(metadata_path)
-        self.datacollection_name = self.metadata_path.stem.split("_")[
-            -1
-        ]  # Extract datacollection name from filename
-        self.context_len = context_len
-        self.stride = stride
-        self.lazy = lazy
-        self.max_image_size = max_image_size
-        if image_folder_path is None:
-            self.image_folder_path = self.metadata_path.parent
-        else:
-            self.image_folder_path = Path(image_folder_path)
-
-        # Load metadata lazily
-        if self.metadata_path.suffix == ".parquet":
-            self.data = (
-                pl.scan_parquet(str(metadata_path))
-                if lazy
-                else pl.read_parquet(str(metadata_path))
-            )
-        elif self.metadata_path.suffix in [".jsonl", ".ndjson"]:
-            self.data = (
-                pl.scan_ndjson(str(metadata_path))
-                if lazy
-                else pl.read_ndjson(str(metadata_path))
-            )
-        else:
-            raise ValueError(f"Unsupported format: {self.metadata_path.suffix}")
-
-    def __iter__(self) -> Iterator[Dict]:
-        """
-        Iterate over the dataset, yielding one sequence at a time.
-        Sequences are generated on-the-fly from raw gaze data.
-        """
-        # Collect data if lazy
-        data = self.data.collect() if self.lazy else self.data
-
-        # Iterate through each recording session
-        for row in data.iter_rows(named=True):
-            gaze_data = row.get("data", [])
-
-            # Skip if not enough data to create sequences
-            if not gaze_data or len(gaze_data) < self.context_len + 1:
-                continue
-
-            # Generate sequences from this recording
-            yield from self._generate_sequences(row, gaze_data)
-
-    def _image_transform(self, image_path: Path, max_size=512) -> torch.Tensor:
-        if self.max_image_size is not None:
-            max_size = self.max_image_size
-
-        screen_resolution = SCREEN_RESOLUTION[
-            self.datacollection_name
-        ]  # SCREEN_RESOLUTION[self.datacollection_name] # for example (1920, 1080)  # Example screen resolution, adjust as needed
-        image = decode_image(str(image_path))
-        padding_val = [
-            0,
-            0,
-            screen_resolution[0] - image.shape[2],
-            screen_resolution[1] - image.shape[1],
-        ]
-        self.scaling_factor = max_size / screen_resolution[0]
-        transform = v2.Compose(
-            [
-                v2.Pad(padding=padding_val, padding_mode="edge"),
-                v2.Resize(size=None, max_size=max_size),
-                # ToDo just for testing purposes has to be adapted to the actual image size and model requirements max size
-                MyCustomTransform(padding_mode="edge"),
-                v2.ToDtype(torch.float32, scale=True),
-                v2.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-                # get normalized values for RGB channels (assuming image is in RGB format
-            ]
-        )
-
-        return transform(image)
-
-    def _text_transform(self, text: str) -> torch.Tensor:
-        # Placeholder for text transformation (e.g., tokenization)
-        # For now, we return an empty tensor since we don't have text data
-        return torch.empty(0)
-
-    def _generate_sequences(
-        self,
-        row: Dict,
-        gaze_data: list,
-    ) -> Iterator[Dict]:
-        """
-        Generate all sequences from a single recording session.
-
-        Args:
-            row: Metadata row (contains participant_id, stimulus_id, etc.)
-            gaze_data: List of gaze samples [{'pixel_x': ..., 'pixel_y': ...}, ...]
-
-        Yields:
-            Dict with input_seq, target_seq, stimulus image and metadata
-        """
-        transformed_image = self._image_transform(
-            self.metadata_path.parent / row.get("file_name")
-        )
-        # Generate sequences with specified stride
-        for i in range(0, len(gaze_data) - self.context_len, self.stride):
-            # Extract input and target sequences
-            input_gaze = gaze_data[i : i + self.context_len]
-            target_gaze = gaze_data[i + 1 : i + self.context_len + 1]
-
-            # Convert to numpy arrays
-            input_seq = np.array(
-                [
-                    [
-                        g["pixel_x"] * self.scaling_factor
-                        if type(g["pixel_x"]) is float
-                        else 0,
-                        g["pixel_y"] * self.scaling_factor
-                        if g["pixel_y"] is not None
-                        else 0,
-                    ]
-                    for g in input_gaze
-                ],
-                dtype=np.float32,
-            )
-            target_seq = np.array(
-                [
-                    [
-                        g["pixel_x"] * self.scaling_factor
-                        if g["pixel_x"] is not None
-                        else 0,
-                        g["pixel_y"] * self.scaling_factor
-                        if g["pixel_y"] is not None
-                        else 0,
-                    ]
-                    for g in target_gaze
-                ],
-                dtype=np.float32,
-            )
-
-            yield {
-                "input_seq": torch.from_numpy(input_seq),
-                "target_seq": torch.from_numpy(target_seq),
-                # "participant_id": row.get("participant_id"),
-                # "stimulus_id": row.get("stimulus_id"),
-                "image": transformed_image,
-            }
-
-
 class PymovementsOnTheFlyGazeDataset(IterableDataset):
     """
     Dataset that generates gaze sequences on-the-fly using pymovements datasets.
@@ -226,17 +52,19 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
         self,
         dataset_name: str,
         context_len: int = 32,
-        stride: int = 1,
         max_image_size: int = 512,
-        root: str = "data/",
-        subset: Optional[Dict] = None,
+        sampling_ratio: Optional[int] = 1,
+        stride: Optional[int] = 32,
+        root: Optional[str] = None,
+        subset: Optional[dict] = None,
         **kwargs,
     ):
         """
         Args:
             dataset_name: Name of the pymovements dataset (e.g., 'GGTG', 'MultiplEYE_DE_DE_Goettingen_1_2026')
             context_len: Length of input sequence
-            stride: Step between timesteps, e.g. a way to downsample the raw data
+            stride: step between sequences
+            sampling_ratio: Step between timesteps, e.g. a way to downsample the raw data
             max_image_size: Max size for image resizing
             root: Root directory for dataset
             subset: Subset to load (e.g., {"subject_id": ["P01"]})
@@ -251,9 +79,16 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
 
         """
         self.dataset_name = dataset_name
+        if root is None:
+            self.root = f"data/{dataset_name}"
+        else:
+            self.root = root
+        assert os.path.exists(self.root), f"Path {self.root} does not exist"
+
         self.context_len = context_len
         self.stride = stride
         self.max_image_size = max_image_size
+        self.sampling_ratio = sampling_ratio
 
         # Load pymovements dataset
         dataset_paths = pm.DatasetPaths(root=root)
@@ -290,9 +125,13 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
         elif dataset_name == "mcfw-gaze":
             self.gazeframes = pl.concat(
                 [
-                    gaze.samples.with_columns(
-                        pl.lit(gaze.metadata["subject_id"]).alias("subject_id"),
-                        pl.lit(gaze.metadata["stimulus"]).alias("stimulus"),
+                    gaze.samples.select(["pixel", "time"]).with_columns(
+                        pl.lit(gaze.metadata["subject_id"])
+                        .cast(pl.Utf8)
+                        .alias("subject_id"),
+                        pl.lit(gaze.metadata["stimulus"])
+                        .cast(pl.Utf8)
+                        .alias("stimulus"),
                         # pl.lit(gaze.metadata["trial_id"]).alias("trial_id"),
                     )
                     for gaze in self.pm_dataset.gaze
@@ -310,43 +149,64 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
                 ]
             )
         # Convert stimuli to polars
+        grouped = self.gazeframes.group_by(["subject_id", "stimulus"])
+        self.groups = [
+            (key, group) for key, group in grouped
+        ]  # materialise once at init
         self.stimuli = self.pm_dataset.fileinfo["ImageStimulus"]
 
-    def __iter__(self) -> Iterator[Dict]:
-        """
-        Iterate over the dataset, yielding sequences from pymovements data.
-        """
-        # Materialize groups into a list to avoid Polars multiprocessing deadlock
-        # This converts the GroupBy iterator to a concrete list before iterating
-        grouped = self.gazeframes.group_by(["subject_id", "stimulus"])
-        groups = [(group_key, group) for group_key, group in grouped]
-
-        for group_key, group in groups:
-            subject_id, stimulus = group_key
-            # Get screen resolution for this subject
-            screen_width_px, screen_height_px = self.screen_resolutions[subject_id]
+        self.all_sequences = []
+        image_cache = {}  # cache transformed images by path
+        for (subject_id, stimulus), group in tqdm(
+            self.groups, desc="Pre-computing sequences"
+        ):
+            screen_width_px, _ = self.screen_resolutions[subject_id]
             self.scaling_factor = self.max_image_size / screen_width_px
 
-            # Convert group to list of dicts, assuming 'pixel' column contains [x, y] lists
-            gaze_data = group.select("pixel")
+            gaze_data = group.select("pixel").gather_every(self.stride)
 
-            # Skip if not enough data
             if len(gaze_data) < self.context_len + 1:
                 continue
 
-            # Get stimulus info, assuming 'filename' matches 'stimulus'
             stimulus_row = self.stimuli.filter(pl.col("stimulus") == stimulus)
             if stimulus_row.is_empty():
                 continue
+
             image_path = Path(
                 self.pm_dataset.paths.stimuli / stimulus_row["filepath"][0]
             )
+            # Only load/transform each image once
+            if image_path not in image_cache:
+                image_cache[image_path] = self._image_transform(image_path)
+            transformed_image = image_cache[image_path]
 
-            # Transform image with subject's screen resolution
-            transformed_image = self._image_transform(image_path)
+            seqs = list(self._generate_sequences(gaze_data, transformed_image))
+            self.all_sequences.extend(seqs)
 
-            # Generate sequences
-            yield from self._generate_sequences(gaze_data, transformed_image)
+        print(
+            f"Pre-computed {len(self.all_sequences)} sequences, "
+            f"{len(image_cache)} unique images cached"
+        )
+
+    def __iter__(self) -> Iterator[Dict]:
+        """
+        Iterate over pre-computed sequences with rank and worker splitting.
+        All Polars operations happen at init time in the main process,
+        so workers only ever see plain Python lists — no deadlocks.
+        """
+        sequences = self.all_sequences
+
+        # Split across GPUs (ranks)
+        num_replicas = int(os.environ.get("WORLD_SIZE", 1))
+        rank = int(os.environ.get("RANK", 0))
+        sequences = sequences[rank::num_replicas]
+
+        # Split across dataloader workers within this rank
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            sequences = sequences[worker_info.id :: worker_info.num_workers]
+
+        yield from iter(sequences)
 
     def _image_transform_coordiantes_preserving(
         self, image_path: Path, screen_width_px: int, screen_height_px: int
@@ -393,64 +253,57 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
             [
                 v2.Resize(size=None, max_size=self.max_image_size),
                 v2.ToDtype(torch.float32, scale=True),
+                MyCustomTransform(padding_mode="edge"),
                 v2.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
             ]
         )
         return transform(image)
 
     def _generate_sequences(
-        self, gaze_data: list, transformed_image: torch.Tensor
+        self, gaze_data: pl.DataFrame, transformed_image: torch.Tensor
     ) -> Iterator[Dict]:
-        """function to generate sequences from pymovements data.
-        filling the pixel null values with 0.0 to keep the information about data loss in the gaze data,
-        to let the model learn to handle missing data.
-        Could also be filtered"""
-        # Ensure no nulls in 'pixel' column, fill with [0.0, 0.0] if null, and fill nulls inside lists with 0.0
-
+        # 1. Clean nulls
         gaze_data_cleaned = gaze_data.with_columns(
             pl.col("pixel")
-            .fill_null(pl.lit([0.0, 0.0]))  # case: whole list = null
-            .list.eval(pl.element().fill_null(0.0))  # case: elements inside list null
+            .fill_null(pl.lit([0.0, 0.0]))
+            .list.eval(pl.element().fill_null(0.0))
             .alias("pixel")
         )
+
+        # 2. Downsample AFTER cleaning (was applied to wrong variable before)
+        if self.sampling_ratio > 1:
+            gaze_data_cleaned = gaze_data_cleaned.gather_every(self.sampling_ratio)
 
         for i in range(0, len(gaze_data_cleaned) - self.context_len, self.stride):
             input_gaze = gaze_data_cleaned[i : i + self.context_len]
             target_gaze = gaze_data_cleaned[i + 1 : i + self.context_len + 1]
 
-            input_seq = (
-                np.array(
+            # Build (T, 2) arrays then transpose to (2, T) — no squeeze needed
+            input_seq = np.array(
+                [
                     [
-                        [
-                            g.list.get(0) * self.scaling_factor,
-                            g.list.get(1) * self.scaling_factor,
-                        ]
-                        for g in input_gaze
-                    ],
-                    dtype=np.float32,
-                )
-                .squeeze()
-                .T
-            )
+                        row["pixel"][0] * self.scaling_factor,
+                        row["pixel"][1] * self.scaling_factor,
+                    ]
+                    for row in input_gaze.iter_rows(named=True)
+                ],
+                dtype=np.float32,
+            ).T  # (2, T)
 
-            target_seq = (
-                np.array(
+            target_seq = np.array(
+                [
                     [
-                        [
-                            g.list.get(0) * self.scaling_factor,
-                            g.list.get(1) * self.scaling_factor,
-                        ]
-                        for g in target_gaze
-                    ],
-                    dtype=np.float32,
-                )
-                .squeeze()
-                .T
-            )
+                        row["pixel"][0] * self.scaling_factor,
+                        row["pixel"][1] * self.scaling_factor,
+                    ]
+                    for row in target_gaze.iter_rows(named=True)
+                ],
+                dtype=np.float32,
+            ).T  # (2, T)
 
             yield {
-                "input_seq": torch.from_numpy(input_seq),
-                "target_seq": torch.from_numpy(target_seq),
+                "input_seq": torch.from_numpy(input_seq),  # (2, T)
+                "target_seq": torch.from_numpy(target_seq),  # (2, T)
                 "image": transformed_image,
             }
 
@@ -465,8 +318,9 @@ def create_on_the_fly_loader(
     dataset_type: str = "standard",
     max_image_size: int = 224,
     image_folder_path: Optional[str] = None,
-    root: str = "data/",
+    root: Optional[str] = None,
     subset: Optional[Dict] = None,
+    sampling_ratio=100,
 ) -> DataLoader:
     """
     Create a DataLoader with on-the-fly sequence generation.
@@ -486,6 +340,7 @@ def create_on_the_fly_loader(
 
     Returns:
         DataLoader ready for training
+        :param sampling_ratio:
     """
 
     if dataset_name is not None:
@@ -501,30 +356,23 @@ def create_on_the_fly_loader(
             )
         else:
             raise ValueError(f"Unknown dataset type: {dataset_type}")
-    elif metadata_path is not None:
-        # Use original dataset
-        if dataset_type == "standard":
-            dataset = OnTheFlyGazeDataset(
-                metadata_path,
-                context_len=context_len,
-                stride=stride,
-                max_image_size=max_image_size,
-                image_folder_path=image_folder_path,
-            )
-        else:
-            raise ValueError(f"Unknown dataset type: {dataset_type}")
+
     else:
         raise ValueError("Either metadata_path or dataset_name must be provided")
 
     # prefetch_factor can only be used with num_workers > 0
     dataloader_kwargs = {
         "batch_size": batch_size,
-        "num_workers": num_workers,
-        "pin_memory": True,
+        "num_workers": 0,
+        "pin_memory": False,
+        "prefetch_factor": None,
     }
 
     if num_workers > 0:
         dataloader_kwargs["prefetch_factor"] = 2
+        dataloader_kwargs["num_workers"] = num_workers
+    print(f"Raw gaze rows: {len(dataset.gazeframes)}")
+    print(dataset.gazeframes.head())
 
     return DataLoader(dataset, **dataloader_kwargs)
 
@@ -535,21 +383,20 @@ if __name__ == "__main__":
     print("On-the-Fly Sequence Generation Example")
     print("=" * 60)
 
-    # # Create loader
-    # loader_gazebase = create_on_the_fly_loader(
-    #     dataset_name="GazeBase",
-    #     #metadata_path="C:/Users/saphi/PycharmProjects/thesis/kaamba_repo/kaamba_dataset/stimuli/Goettingen/metadata_Goettingen.parquet",
-    #     subset={
-    #         "subject_id": [288],
-    #         "round_id": [1],
-    #         "task_name": ["TEX"],
-    #     },  # Optional: load specific subjects
-    #     batch_size=32,
-    #     context_len=32,
-    #     stride=1,
-    #     max_image_size=512,
-    #     root="/home/janhof/thesis/data/",
-    # )
+    # Create loader
+    loader_gazebase = create_on_the_fly_loader(
+        dataset_name="GazeBase",
+        batch_size=32,
+        context_len=32,
+        stride=32,
+        max_image_size=512,
+        root="/home/janhof/thesis/data/",
+        subset={
+            "subject_id": [288],
+            "round_id": [1],
+            "task_name": ["TEX"],
+        },
+    )
     # Create loader
     loader = create_on_the_fly_loader(
         dataset_name="mcfw-gaze",
@@ -561,7 +408,8 @@ if __name__ == "__main__":
         },  # Optional: load specific subjects
         batch_size=32,
         context_len=32,
-        stride=1,
+        stride=32,
+        sampling_ratio=100,
         max_image_size=512,
         root="/home/janhof/thesis/data/",
     )
