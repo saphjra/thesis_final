@@ -46,7 +46,10 @@ from optuna.samplers import TPESampler
 from tqdm import tqdm
 
 from kaamba.net.models.kaamba import build_gaze_predictor
-from kaamba.utils.dataloader_config_builder import DataloaderConfigBuilder
+from kaamba.utils.dataloader_config_builder import (
+    DataloaderConfigBuilder,
+    InterleavedLoader,
+)
 from kaamba.utils.loss_functions import gmm_nll
 from kaamba.utils.memory_monitor import MemoryMonitor, memory_tracker
 
@@ -59,6 +62,10 @@ ENCODER_CONFIGS = {
     "vit_base": {"encoder_type": "vit", "model_name": "google/vit-base-patch16-224"},
     "vit_large": {"encoder_type": "vit", "model_name": "google/vit-large-patch16-224"},
     "resnet": {"encoder_type": "resnet"},
+    "siglip": {
+        "encoder_type": "siglip",
+        "model_name": "google/siglip-base-patch16-224",
+    },
 }
 
 
@@ -384,9 +391,9 @@ def train_on_the_fly(
     dataset_name: str | List[str],
     root: str,
     split_strategy: str = "participant",
-    train_ratio: float = 0.70,
-    val_ratio: float = 0.15,
-    test_ratio: float = 0.15,
+    train_ratio: float = 0.80,
+    val_ratio: float = 0.2,
+    test_ratio: float = 0.0,
     exclude_participants: Optional[List] = None,
     exclude_stimuli: Optional[List] = None,
     exclude_trials: Optional[List] = None,
@@ -501,10 +508,18 @@ def train_on_the_fly(
         )
         training_monitor = TrainingMonitor(patience=patience)
 
-        model, optimizer, train_loader, scheduler = accelerator.prepare(
-            model, optimizer, train_loader, scheduler
-        )
-        val_loader, test_loader = accelerator.prepare(val_loader, test_loader)
+        model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
+
+        def _prepare_loader(loader, accelerator):
+            if isinstance(loader, InterleavedLoader):
+                loader.loaders = [accelerator.prepare(load) for load in loader.loaders]
+                return loader
+            return accelerator.prepare(loader)
+
+        train_loader = _prepare_loader(train_loader, accelerator)
+        val_loader = _prepare_loader(val_loader, accelerator)
+        if not test_ratio == 0.0:
+            test_loader = _prepare_loader(test_loader, accelerator)
 
         start_epoch = 0
         if resume_from:
@@ -609,6 +624,8 @@ def train_on_the_fly(
                 break
 
         # ── Final test eval ───────────────────────────────────────────────
+        if not test_loader:
+            test_loader = val_loader
         test_loss = validate(model, test_loader, accelerator)
         tracker.log_final_eval(
             {
@@ -671,13 +688,13 @@ def run_hparam_search(
     exclude_participants: Optional[List] = None,
     exclude_stimuli: Optional[List] = None,
     exclude_trials: Optional[List] = None,
-    context_len: int = 32,
+    context_len: int = 128,
     sampling_step: int = 1,
     max_image_size: int = 224,
     num_workers: int = 1,
     # Search budget
     n_trials: int = 50,
-    n_epochs_per_trial: int = 15,
+    n_epochs_per_trial: int = 10,
     max_batches_per_epoch: Optional[int] = 200,
     # Study persistence
     study_name: str = "gaze_mamba_search",
@@ -707,11 +724,11 @@ def run_hparam_search(
         # ── Sample hyperparameters ────────────────────────────────────────
         model_config = {
             "encoder_type": trial.suggest_categorical(
-                "encoder_type", ["vit", "resnet"]
+                "encoder_type", ["vit", "resnet", "siglip"]
             ),
             "model_name": "google/vit-base-patch16-224",  # fixed for vit
             "d_model": trial.suggest_categorical("d_model", [128, 256, 512, 1024]),
-            "n_layers": trial.suggest_int("n_layers", 2, 10),
+            "n_layers": trial.suggest_int("n_layers", 4, 12),
             "n_mix": trial.suggest_int("n_mix", 3, 8),
             "image_embed_dim": trial.suggest_categorical("image_embed_dim", [256, 512]),
             "conditioning_mode": trial.suggest_categorical(
@@ -719,6 +736,9 @@ def run_hparam_search(
             ),
             "freeze_encoder": True,
         }
+        model_config["model_name"] = ENCODER_CONFIGS[model_config["encoder_type"]][
+            "model_name"
+        ]
         lr = trial.suggest_float("lr", 1e-6, 1e-3, log=True)
         weight_decay = trial.suggest_float("weight_decay", 1e-7, 1e-3, log=True)
         grad_clip = trial.suggest_float("grad_clip", 0.1, 2.0)
@@ -798,32 +818,32 @@ def run_hparam_search(
 
 def _build_parser():
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["train", "search"], default="search")
+    p.add_argument("--mode", choices=["train", "search"], default="train")
 
     # shared data args
     p.add_argument("--datasets", nargs="+", default=["mcfw-gaze", "GGTG"])
     p.add_argument("--root", default="/home/janhof/thesis/data/")
     p.add_argument("--log_dir", default="/home/janhof/thesis/logs/runs")
-    p.add_argument("--context_len", type=int, default=128)
+    p.add_argument("--context_len", type=int, default=32)
     p.add_argument("--sampling_step", type=int, default=1)
     p.add_argument("--max_image_size", type=int, default=224)
-    p.add_argument("--num_workers", type=int, default=2)
+    p.add_argument("--num_workers", type=int, default=1)
 
     # train-only
     p.add_argument("--num_epochs", type=int, default=100)
-    p.add_argument("--batch_size", type=int, default=256)
-    p.add_argument("--lr", type=float, default=0.000476)
-    p.add_argument("--weight_decay", type=float, default=1.436709513866423e-05)
-    p.add_argument("--grad_clip", type=float, default=1.634)
+    p.add_argument("--batch_size", type=int, default=1024)
+    p.add_argument("--lr", type=float, default=0.00047323940014353053)
+    p.add_argument("--weight_decay", type=float, default=1.1930365027846787e-07)
+    p.add_argument("--grad_clip", type=float, default=1.6233822288702624)
     p.add_argument("--patience", type=int, default=5)
     p.add_argument("--resume_from", default=None)
     p.add_argument("--use_wandb", action="store_true")
 
     # search-only
     p.add_argument("--n_trials", type=int, default=50)
-    p.add_argument("--n_epochs_per_trial", type=int, default=15)
-    p.add_argument("--max_batches_per_epoch", type=int, default=200)
-    p.add_argument("--study_name", default="gaze_mamba_search_new")
+    p.add_argument("--n_epochs_per_trial", type=int, default=10)
+    p.add_argument("--max_batches_per_epoch", type=int, default=128)
+    p.add_argument("--study_name", default="gaze_mamba_search")
     p.add_argument("--storage", default=None)
 
     return p
@@ -834,11 +854,11 @@ def main():
 
     if args.mode == "train":
         model_config = {
-            **ENCODER_CONFIGS["resnet"],
+            **ENCODER_CONFIGS["siglip"],
             "d_model": 128,
-            "n_layers": 3,
-            "n_mix": 8,
-            "image_embed_dim": 1024,
+            "n_layers": 4,
+            "n_mix": 4,
+            "image_embed_dim": 512,
             "conditioning_mode": "initial_state",
             "freeze_encoder": True,
         }
@@ -847,7 +867,7 @@ def main():
             model_config=model_config,
             dataset_name=args.datasets,
             root=args.root,
-            split_strategy="participant",
+            split_strategy="random",
             context_len=args.context_len,
             sampling_step=args.sampling_step,
             max_image_size=args.max_image_size,
@@ -862,6 +882,9 @@ def main():
             resume_from=args.resume_from,
             use_wandb=args.use_wandb,
             accelerator=accelerator,
+            exclude_trials=["", "4", "5"],
+            exclude_participants=["P01", "P02", "P03", "P04", "P06", "P07", "P08"],
+            exclude_stimuli=None,
         )
         accelerator.end_training()
 
@@ -880,6 +903,18 @@ def main():
             log_dir=args.log_dir,
             storage=args.storage,
             use_wandb=args.use_wandb,
+            exclude_trials=["", "2", "4", "5"],
+            exclude_participants=[
+                "P01",
+                "P02",
+                "P03",
+                "P04",
+                "P05",
+                "P06",
+                "P07",
+                "P08",
+            ],
+            exclude_stimuli=None,
         )
 
 
