@@ -68,6 +68,14 @@ ENCODER_CONFIGS = {
     },
 }
 
+# Maps the short encoder_type names used in Optuna suggestions to their default
+# HuggingFace model names.  ResNet is absent — it loads ImageNet weights via
+# torchvision and does not accept a model_name argument.
+_ENCODER_MODEL_NAMES = {
+    "vit": "google/vit-base-patch16-224",
+    "siglip": "google/siglip-base-patch16-224",
+}
+
 
 # ---------------------------------------------------------------------------
 # ExperimentConfig — single source of truth for every run
@@ -726,7 +734,6 @@ def run_hparam_search(
             "encoder_type": trial.suggest_categorical(
                 "encoder_type", ["vit", "resnet", "siglip"]
             ),
-            "model_name": "google/vit-base-patch16-224",  # fixed for vit
             "d_model": trial.suggest_categorical("d_model", [128, 256, 512, 1024]),
             "n_layers": trial.suggest_int("n_layers", 4, 12),
             "n_mix": trial.suggest_int("n_mix", 3, 8),
@@ -736,9 +743,10 @@ def run_hparam_search(
             ),
             "freeze_encoder": True,
         }
-        model_config["model_name"] = ENCODER_CONFIGS[model_config["encoder_type"]][
-            "model_name"
-        ]
+        # ResNet has no HuggingFace model_name — only add it for vit / siglip
+        model_name = _ENCODER_MODEL_NAMES.get(model_config["encoder_type"])
+        if model_name is not None:
+            model_config["model_name"] = model_name
         lr = trial.suggest_float("lr", 1e-6, 1e-3, log=True)
         weight_decay = trial.suggest_float("weight_decay", 1e-7, 1e-3, log=True)
         grad_clip = trial.suggest_float("grad_clip", 0.1, 2.0)

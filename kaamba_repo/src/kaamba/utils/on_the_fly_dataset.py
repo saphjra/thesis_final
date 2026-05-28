@@ -57,6 +57,7 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
         stride: Optional[int] = 32,
         root: Optional[str] = None,
         subset: Optional[dict] = None,
+        fill_strategy: Optional[str] = None,
         **kwargs,
     ):
         """
@@ -118,6 +119,12 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
             self.gazeframes = pl.concat(
                 [
                     gaze.samples.select(["pixel", "time"]).with_columns(
+                        pl.concat_list(
+                            [
+                                pl.col("pixel").list.get(0),
+                                pl.col("pixel").list.get(1),
+                            ]
+                        ).alias("pixel"),
                         pl.lit(gaze.metadata["subject_id"])
                         .cast(pl.Utf8)
                         .alias("subject_id"),
@@ -126,6 +133,7 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
                         .alias("stimulus"),
                         # pl.lit(gaze.metadata["trial_id"]).alias("trial_id"),
                     )
+                    # Todo implement it with the actual yaml from pm, should be smth like:
                     for gaze in self.pm_dataset.gaze
                 ]
             )
@@ -140,9 +148,13 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
                         # they are valid signal (e.g. -0.02 = just off the left edge).
                         pl.concat_list(
                             [
-                                pl.col("pixel").list.get(0)
-                                / gaze.experiment.screen.width_px,
-                                pl.col("pixel").list.get(1)
+                                pl.col("pixel")
+                                .list.get(0)
+                                .fill_null(strategy="forward")
+                                / gaze.experiment.screen.width_px,  # Todo have to make this preprocessing transparent
+                                pl.col("pixel")
+                                .list.get(1)
+                                .fill_null(strategy="forward")
                                 / gaze.experiment.screen.height_px,
                             ]
                         ).alias("pixel"),
@@ -162,14 +174,18 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
             self.gazeframes = pl.concat(
                 [
                     gaze.samples.select(["pixel", "time"]).with_columns(
-                        # Normalize in-place using this gaze object's screen resolution.
+                        # Normalise in-place using this gaze object's screen resolution.
                         # Values outside [0,1] (off-screen gaze) are kept as-is —
                         # they are valid signal (e.g. -0.02 = just off the left edge).
                         pl.concat_list(
                             [
-                                pl.col("pixel").list.get(0)
+                                pl.col("pixel")
+                                .list.get(0)
+                                .fill_null(strategy="forward")
                                 / gaze.experiment.screen.width_px,
-                                pl.col("pixel").list.get(1)
+                                pl.col("pixel")
+                                .list.get(1)
+                                .fill_null(strategy="forward")
                                 / gaze.experiment.screen.height_px,
                             ]
                         ).alias("pixel"),
@@ -242,6 +258,9 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
 
         yield from iter(sequences)
 
+    def __len__(self) -> int:
+        return len(self.all_sequences)
+
     def _image_transform_coordiantes_preserving(
         self, image_path: Path, screen_width_px: int, screen_height_px: int
     ) -> torch.Tensor:
@@ -299,7 +318,9 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
         # 1. Clean nulls
         gaze_data_cleaned = gaze_data.with_columns(
             pl.col("pixel")
-            .fill_null(pl.lit([0.0, 0.0]))
+            .fill_null(
+                pl.lit([0.0, 0.0])
+            )  # Todo have to make this preprocessing transparent (first fill gaze data with polars fill null forward (to get less 0.0 data and then fill the rest with 0.0, i think other wise model is often predicting 0.0
             .list.eval(pl.element().fill_null(0.0))
             .alias("pixel")
         )
@@ -353,6 +374,8 @@ def create_on_the_fly_loader(
     root: Optional[str] = None,
     subset: Optional[Dict] = None,
     sampling_step=1,
+    persistent_workers=False,
+    prefetch_factor=None,
 ) -> DataLoader:
     """
     Create a DataLoader with on-the-fly sequence generation.
