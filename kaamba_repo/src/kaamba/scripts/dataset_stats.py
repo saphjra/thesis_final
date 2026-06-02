@@ -50,7 +50,7 @@ import argparse
 import json
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import polars as pl
@@ -69,10 +69,10 @@ C1 = "#1D9E75"  # teal  — matches evaluate_model.py real-data colour
 C2 = "#7F77DD"  # purple
 C_GRID = "#E8E6DE"
 C_TEXT = "#2C2C2A"
-PHYSIO_FIX_MIN_MS = 100.0  # minimum plausible fixation duration
+PHYSIO_FIX_MIN_MS = 20.0  # minimum plausible fixation duration
 PHYSIO_FIX_MAX_MS = 800.0  # maximum plausible fixation duration
-PHYSIO_SAC_MIN_DEG = 0.5
-PHYSIO_SAC_MAX_DEG = 20.0
+PHYSIO_SAC_MIN_DEG = 30
+PHYSIO_SAC_MAX_DEG = 500.0
 
 
 plt.rcParams.update(
@@ -92,125 +92,102 @@ plt.rcParams.update(
 
 
 # ---------------------------------------------------------------------------
-# Event extraction helpers  (identical pipeline to evaluate_model.py)
+# pymovements-native preprocessing helpers
+# (mirrors evaluate_model.py — dataset.pix2deg / pos2vel / detect_events /
+#  compute_event_properties are called at dataset level before the loop)
 # ---------------------------------------------------------------------------
 
+_EMPTY_FIX = pl.DataFrame(
+    schema={
+        "name": pl.Utf8,
+        "onset": pl.Int64,
+        "offset": pl.Int64,
+        "duration": pl.Int64,
+        "cx_deg": pl.Float64,
+        "cy_deg": pl.Float64,
+    }
+)
+_EMPTY_SAC = pl.DataFrame(
+    schema={
+        "name": pl.Utf8,
+        "onset": pl.Int64,
+        "offset": pl.Int64,
+        "duration": pl.Int64,
+        "amplitude_deg": pl.Float64,
+        "peak_vel_deg_s": pl.Float64,
+        "angle_rad": pl.Float64,
+    }
+)
 
-def _gaze_obj_to_arrays(
-    gaze,
-    vel_threshold: float = 30.0,
-    min_fix_dur: int = 10,
-    screen_w_deg: float = 36.0,
-    screen_h_deg: float = 20.0,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, object, object]:
+
+def _fix_df_from_events(ev_frame: pl.DataFrame, pos_arr: np.ndarray) -> pl.DataFrame:
     """
-    Returns (pos_arr_deg, vel_arr_deg_s, norm_arr, fix_events, sac_events).
-    Handles both normalised [0,1] and raw-pixel gaze coordinates.
+    Filter fixation.ivt events and append centroid columns cx_deg / cy_deg
+    (mean position in degrees of visual angle per fixation).
+    pos_arr: (T, 2) from gaze.samples["position"] after pix2deg().
     """
-    px_arr = np.stack(gaze.samples["pixel"].to_numpy())
-    is_normalised = px_arr.max() <= 2.0
-    screen = gaze.experiment.screen
-
-    if is_normalised:
-        pos_arr = np.stack(
-            [px_arr[:, 0] * screen_w_deg, px_arr[:, 1] * screen_h_deg], axis=1
-        )
-        norm_arr = px_arr
-    else:
-        gaze.pix2deg()
-        pos_arr = np.stack(gaze.samples["position"].to_numpy())
-        norm_arr = np.stack(
-            [px_arr[:, 0] / screen.width_px, px_arr[:, 1] / screen.height_px], axis=1
-        )
-
-    sr = gaze.experiment.sampling_rate
-    vel_arr = np.diff(pos_arr, axis=0) * sr
-    vel_arr = np.concatenate([vel_arr[:1], vel_arr])
-    vel_arr = np.nan_to_num(vel_arr, nan=0.0)
-
-    T = len(pos_arr)
-    timesteps = np.arange(T, dtype=int)
-
-    fix_events = pm.events.ivt(
-        vel_arr,
-        timesteps=timesteps,
-        velocity_threshold=vel_threshold,
-        minimum_duration=min_fix_dur,
-    )
-    sac_events = pm.events.fill(fix_events, timesteps=timesteps, name="saccade")
-
-    return pos_arr, vel_arr, norm_arr, fix_events, sac_events
-
-
-def _enrich_fixations(fix_events, pos_arr: np.ndarray) -> pl.DataFrame:
-    rows = []
-    for row in fix_events.frame.iter_rows(named=True):
+    if ev_frame is None or len(ev_frame) == 0:
+        return _EMPTY_FIX
+    fix = ev_frame.filter(pl.col("name") == "fixation.ivt")
+    if len(fix) == 0:
+        return _EMPTY_FIX
+    cx_list, cy_list = [], []
+    for row in fix.iter_rows(named=True):
         seg = pos_arr[row["onset"] : row["offset"]]
         if len(seg) == 0:
-            continue
-        rows.append(
-            {
-                **row,
-                "cx_deg": float(seg[:, 0].mean()),
-                "cy_deg": float(seg[:, 1].mean()),
-            }
-        )
-    return (
-        pl.DataFrame(rows)
-        if rows
-        else pl.DataFrame(
-            schema={
-                "name": pl.Utf8,
-                "onset": pl.Int64,
-                "offset": pl.Int64,
-                "duration": pl.Int64,
-                "cx_deg": pl.Float64,
-                "cy_deg": pl.Float64,
-            }
-        )
+            cx_list.append(float("nan"))
+            cy_list.append(float("nan"))
+        else:
+            cx_list.append(float(seg[:, 0].mean()))
+            cy_list.append(float(seg[:, 1].mean()))
+    result = fix.with_columns(
+        [
+            pl.Series("cx_deg", cx_list, dtype=pl.Float64),
+            pl.Series("cy_deg", cy_list, dtype=pl.Float64),
+        ]
     )
+    keep = ["name", "onset", "offset", "duration", "cx_deg", "cy_deg"]
+    return result.select([c for c in keep if c in result.columns])
 
 
-def _enrich_saccades(
-    sac_events, pos_arr: np.ndarray, vel_arr: np.ndarray
-) -> pl.DataFrame:
-    rows = []
-    for row in sac_events.frame.iter_rows(named=True):
-        seg_pos = pos_arr[row["onset"] : row["offset"]]
-        seg_vel = vel_arr[row["onset"] : row["offset"]]
-        if len(seg_pos) == 0:
-            continue
-        amp = (
-            float(np.linalg.norm(seg_pos[-1] - seg_pos[0])) if len(seg_pos) > 1 else 0.0
-        )
-        pv = float(np.linalg.norm(seg_vel, axis=1).max()) if len(seg_vel) > 0 else 0.0
-        angle = (
-            float(
-                np.arctan2(
-                    seg_pos[-1, 1] - seg_pos[0, 1], seg_pos[-1, 0] - seg_pos[0, 0]
-                )
+def _sac_df_from_events(ev_frame: pl.DataFrame, pos_arr: np.ndarray) -> pl.DataFrame:
+    """
+    Filter saccade events, append angle_rad (direction), and rename
+    amplitude → amplitude_deg  /  peak_velocity → peak_vel_deg_s.
+    amplitude and peak_velocity are pre-computed by compute_event_properties.
+    """
+    if ev_frame is None or len(ev_frame) == 0:
+        return _EMPTY_SAC
+    sac = ev_frame.filter(pl.col("name") == "saccade")
+    if len(sac) == 0:
+        return _EMPTY_SAC
+    angle_list = []
+    for row in sac.iter_rows(named=True):
+        seg = pos_arr[row["onset"] : row["offset"]]
+        if len(seg) > 1:
+            angle_list.append(
+                float(np.arctan2(seg[-1, 1] - seg[0, 1], seg[-1, 0] - seg[0, 0]))
             )
-            if len(seg_pos) > 1
-            else float("nan")
-        )
-        rows.append(
-            {**row, "amplitude_deg": amp, "peak_vel_deg_s": pv, "angle_rad": angle}
-        )
-    return (
-        pl.DataFrame(rows)
-        if rows
-        else pl.DataFrame(
-            schema={
-                "name": pl.Utf8,
-                "onset": pl.Int64,
-                "offset": pl.Int64,
-                "duration": pl.Int64,
-                "amplitude_deg": pl.Float64,
-                "peak_vel_deg_s": pl.Float64,
-                "angle_rad": pl.Float64,
-            }
-        )
-    )
+        else:
+            angle_list.append(float("nan"))
+    result = sac.with_columns(pl.Series("angle_rad", angle_list, dtype=pl.Float64))
+    rename = {}
+    if "amplitude" in result.columns:
+        rename["amplitude"] = "amplitude_deg"
+    if "peak_velocity" in result.columns:
+        rename["peak_velocity"] = "peak_vel_deg_s"
+    if rename:
+        result = result.rename(rename)
+    keep = [
+        "name",
+        "onset",
+        "offset",
+        "duration",
+        "amplitude_deg",
+        "peak_vel_deg_s",
+        "angle_rad",
+    ]
+    return result.select([c for c in keep if c in result.columns])
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +244,7 @@ def compute_dataset_statistics(
     context_len: int = 32,
     stride: int = 1,
     vel_threshold: float = 30.0,
+    dispersion_threshold: float = 1,
     min_fix_dur: int = 10,
     subset: Optional[dict] = None,
 ) -> Dict:
@@ -313,13 +291,31 @@ def compute_dataset_statistics(
     )
     print(f"  Recordings: {len(dataset.gaze)}")
 
-    # ── Process every recording ───────────────────────────────────────────
+    # ── Preprocess entire dataset with pymovements built-ins ──────────────
+    # Runs once on the stored polars frames — no cloning, no manual velocity.
+    print(
+        "  Preprocessing: pix2deg → pos2vel → IVT → microsaccades → event properties …"
+    )
+    dataset.pix2deg()
+    dataset.pos2vel(method="fivepoint")
+    dataset.detect_events(
+        "idt",
+        minimum_duration=min_fix_dur,
+        dispersion_threshold=dispersion_threshold,
+        name="fixation",
+    )
+    dataset.detect_events(method="fill")
+    # dataset.detect_events("microsaccades", minimum_duration=1)
+    dataset.compute_event_properties(["amplitude", "dispersion", "peak_velocity"])
+    print("  Preprocessing complete")
+
+    # ── Iterate over recordings (position / events already populated) ─────
     participants = set()
     stimuli = set()
 
     recording_durations_s = []
-    recording_lengths = []  # in samples
-    valid_rates = []  # fraction of non-NaN pixels
+    recording_lengths = []  # samples
+    valid_rates = []  # fraction of finite normalised positions
 
     all_fix_df = []
     all_sac_df = []
@@ -327,35 +323,35 @@ def compute_dataset_statistics(
 
     by_stimulus: Dict[str, List[Dict]] = defaultdict(list)
 
-    for gaze in tqdm(dataset.gaze, desc="  Processing recordings"):
+    for gaze, ev_frame in tqdm(
+        zip(dataset.gaze, dataset.events),
+        total=len(dataset.gaze),
+        desc="  Processing recordings",
+    ):
         subject_id = gaze.metadata.get("subject_id", "?")
         stimulus = gaze.metadata.get("stimulus", "?")
         participants.add(subject_id)
         stimuli.add(stimulus)
 
-        g = gaze.clone()
         try:
-            pos_arr, vel_arr, norm_arr, fix_ev, sac_ev = _gaze_obj_to_arrays(
-                g,
-                vel_threshold=vel_threshold,
-                min_fix_dur=min_fix_dur,
-                screen_w_deg=scr_w_deg,
-                screen_h_deg=scr_h_deg,
+            px_raw = np.stack(gaze.samples["pixel"].to_numpy())  # (T,2) px
+            pos_arr = np.stack(gaze.samples["position"].to_numpy())  # (T,2) deg
+            norm_arr = np.column_stack(
+                [px_raw[:, 0] / scr_w_px, px_raw[:, 1] / scr_h_px]
             )
         except Exception as e:
             tqdm.write(f"    [warn] {subject_id}/{stimulus}: {e}")
             continue
 
-        # Validity check — norm_arr is already a float ndarray from _gaze_obj_to_arrays
         valid_mask = np.all(np.isfinite(norm_arr), axis=1)
-        valid_rates.append(valid_mask.mean())
+        valid_rates.append(float(valid_mask.mean()))
 
         T = len(norm_arr)
         recording_lengths.append(T)
         recording_durations_s.append(T / sr)
 
-        fix_df = _enrich_fixations(fix_ev, pos_arr)
-        sac_df = _enrich_saccades(sac_ev, pos_arr, vel_arr)
+        fix_df = _fix_df_from_events(ev_frame.frame, pos_arr)
+        sac_df = _sac_df_from_events(ev_frame.frame, pos_arr)
         all_fix_df.append(fix_df)
         all_sac_df.append(sac_df)
         all_norm_pts.append(norm_arr)
@@ -1090,7 +1086,7 @@ def _plot_comparison(all_stats: Dict[str, Dict], out_path: Path):
 
     metrics = [
         ("fixations", "duration_mean_ms", "Fix. duration\n(ms)", None),
-        ("fixations", "pct_within_physio_range", "Fix. in 100–800 ms\n(%)", None),
+        ("fixations", "pct_within_range", "Fix. in 50–800 ms\n(%)", None),
         ("saccades", "amplitude_mean_deg", "Saccade amplitude\n(°)", None),
         ("saccades", "main_sequence_r", "Main sequence r", 0.9),
         ("saccades", "direction_entropy_bits", "Direction entropy\n(bits)", None),
@@ -1148,6 +1144,7 @@ def run_dataset_stats(
     stride: int = 1,
     vel_threshold: float = 30.0,
     min_fix_dur: int = 10,
+    dispersion_threshold: float = 1.0,
     subset: Optional[dict] = None,
 ) -> Dict[str, Dict]:
     base_dir = Path(out_dir)
@@ -1164,6 +1161,7 @@ def run_dataset_stats(
             context_len=context_len,
             stride=stride,
             vel_threshold=vel_threshold,
+            dispersion_threshold=dispersion_threshold,
             min_fix_dur=min_fix_dur,
             subset=subset,
         )
@@ -1197,20 +1195,20 @@ def _parse():
     )
     p.add_argument(
         "--root",
-        default="C:\\Users\\saphi\PycharmProjects\\thesis\data",
+        default=r"C:\Users\saphi\PycharmProjects\thesis\data",
         help="Root directory for pymovements data",
     )
     p.add_argument("--out_dir", default="dataset_stats", help="Output directory")
     p.add_argument(
         "--context_len",
         type=int,
-        default=32,
+        default=2000,
         help="Context length used to estimate training sequences",
     )
     p.add_argument(
         "--stride",
         type=int,
-        default=1,
+        default=8,
         help="Stride used to estimate training sequences",
     )
     p.add_argument(
@@ -1218,6 +1216,12 @@ def _parse():
         type=float,
         default=30.0,
         help="IVT velocity threshold in deg/s",
+    )
+    p.add_argument(
+        "--dispersion_threshold",
+        type=float,
+        default=1,
+        help="IDT dispresion threshold in deg/visual angle",
     )
     p.add_argument(
         "--min_fix_dur",
@@ -1233,7 +1237,7 @@ def _parse():
 
 def main():
     args = _parse()
-    # subset = {"subject_id": args.subjects} if args.subjects else None
+    subset = {"subject_id": args.subjects} if args.subjects else None
     run_dataset_stats(
         datasets=args.datasets,
         root=args.root,
@@ -1241,14 +1245,9 @@ def main():
         context_len=args.context_len,
         stride=args.stride,
         vel_threshold=args.vel_threshold,
+        dispersion_threshold=args.dispersion_threshold,
         min_fix_dur=args.min_fix_dur,
-        subset={
-            "subject_id": [
-                "P01",
-                "P02",
-                "P03",
-            ]
-        },
+        subset=subset,
     )
 
 

@@ -75,8 +75,6 @@ _ENCODER_MODEL_NAMES = {
     "vit": "google/vit-base-patch16-224",
     "siglip": "google/siglip-base-patch16-224",
 }
-
-
 # ---------------------------------------------------------------------------
 # ExperimentConfig — single source of truth for every run
 # ---------------------------------------------------------------------------
@@ -743,10 +741,12 @@ def run_hparam_search(
             ),
             "freeze_encoder": True,
         }
+
         # ResNet has no HuggingFace model_name — only add it for vit / siglip
         model_name = _ENCODER_MODEL_NAMES.get(model_config["encoder_type"])
         if model_name is not None:
             model_config["model_name"] = model_name
+
         lr = trial.suggest_float("lr", 1e-6, 1e-3, log=True)
         weight_decay = trial.suggest_float("weight_decay", 1e-7, 1e-3, log=True)
         grad_clip = trial.suggest_float("grad_clip", 0.1, 2.0)
@@ -824,58 +824,202 @@ def run_hparam_search(
 # ---------------------------------------------------------------------------
 
 
-def _build_parser():
-    p = argparse.ArgumentParser()
+def _load_config(path: str) -> Tuple[dict, dict]:
+    """
+    Load a JSON config file and return ``(cli_overrides, model_config)``.
+
+    Auto-detects one of three formats produced by this codebase:
+
+    ``config.json``     — ExperimentConfig saved by ExperimentConfig.save().
+                          Has ``model_config`` and ``dataset_names`` keys.
+    ``best_trial.json`` — Optuna best-trial summary from run_hparam_search().
+                          Has ``number``, ``value``, ``params`` keys.
+    plain JSON          — User-written file whose keys already match CLI arg
+                          names.  An optional ``model_config`` key is extracted
+                          and returned separately.
+
+    The first return value uses CLI argument names (e.g. ``datasets`` not
+    ``dataset_names``) so it can be passed directly to
+    ``ArgumentParser.set_defaults(**cli_overrides)``.
+    CLI flags always override file values — the file only sets defaults.
+    """
+    data: dict = json.loads(Path(path).read_text())
+
+    # ── Optuna best_trial.json ────────────────────────────────────────────
+    if {"number", "value", "params"} <= data.keys():
+        params = dict(data["params"])
+        _MODEL_KEYS = {
+            "encoder_type",
+            "d_model",
+            "n_layers",
+            "n_mix",
+            "image_embed_dim",
+            "conditioning_mode",
+            "freeze_encoder",
+        }
+        model_cfg = {k: v for k, v in params.items() if k in _MODEL_KEYS}
+        cli = {k: v for k, v in params.items() if k not in _MODEL_KEYS}
+        return cli, model_cfg
+
+    # ── ExperimentConfig config.json ──────────────────────────────────────
+    if "model_config" in data or "dataset_names" in data:
+        model_cfg = data.pop("model_config", {})
+        _SKIP = {
+            "run_name",
+            "run_id",
+            "trial_number",
+            "split_strategy",
+            "train_ratio",
+            "val_ratio",
+            "test_ratio",
+            "stride",
+        }
+        _KEY_MAP = {"dataset_names": "datasets"}
+        cli = {_KEY_MAP.get(k, k): v for k, v in data.items() if k not in _SKIP}
+        return cli, model_cfg
+
+    # ── Plain JSON (keys already match CLI arg names) ─────────────────────
+    model_cfg = data.pop("model_config", {})
+    return data, model_cfg
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Kaamba gaze predictor — training & hyperparameter search",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Config file (--config):
+  Pass any of the JSON files produced by this script to reproduce or continue
+  a run without retyping every argument.  CLI flags always win over the file.
+
+  config.json       saved per run by ExperimentConfig  (recommended)
+  best_trial.json   Optuna best-trial summary
+  plain JSON        hand-written file with CLI-style keys
+
+  Examples:
+    python train.py --config logs/runs/trial_0019/config.json
+    python train.py --config logs/study/best_trial.json --num_epochs 200
+    python train.py --config my_config.json --datasets mcfw-gaze GGTG
+""",
+    )
+    p.add_argument(
+        "--config",
+        default=None,
+        metavar="PATH",
+        help="JSON config file.  Keys override defaults; CLI flags override file.",
+    )
     p.add_argument("--mode", choices=["train", "search"], default="train")
 
-    # shared data args
-    p.add_argument("--datasets", nargs="+", default=["mcfw-gaze", "GGTG"])
+    # ── shared data args ──────────────────────────────────────────────────
+    p.add_argument("--datasets", nargs="+", default=["mcfw-gaze"])
     p.add_argument("--root", default="/home/janhof/thesis/data/")
     p.add_argument("--log_dir", default="/home/janhof/thesis/logs/runs")
     p.add_argument("--context_len", type=int, default=32)
     p.add_argument("--sampling_step", type=int, default=1)
     p.add_argument("--max_image_size", type=int, default=224)
     p.add_argument("--num_workers", type=int, default=1)
+    p.add_argument(
+        "--exclude_participants",
+        nargs="*",
+        default=None,
+        help="Participant IDs to exclude.  Overrides the hardcoded list.",
+    )
+    p.add_argument(
+        "--exclude_stimuli",
+        nargs="*",
+        default=None,
+        help="Stimulus IDs to exclude.",
+    )
+    p.add_argument(
+        "--exclude_trials",
+        nargs="*",
+        default=None,
+        help="Trial IDs to exclude.",
+    )
 
-    # train-only
+    # ── train-only ────────────────────────────────────────────────────────
     p.add_argument("--num_epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=1024)
-    p.add_argument("--lr", type=float, default=0.00047323940014353053)
-    p.add_argument("--weight_decay", type=float, default=1.1930365027846787e-07)
-    p.add_argument("--grad_clip", type=float, default=1.6233822288702624)
+    p.add_argument("--lr", type=float, default=0.00014293225713757568)
+    p.add_argument("--weight_decay", type=float, default=1.49611258828362e-06)
+    p.add_argument("--grad_clip", type=float, default=0.8121195670502164)
     p.add_argument("--patience", type=int, default=5)
     p.add_argument("--resume_from", default=None)
     p.add_argument("--use_wandb", action="store_true")
 
-    # search-only
+    # ── search-only ───────────────────────────────────────────────────────
     p.add_argument("--n_trials", type=int, default=50)
     p.add_argument("--n_epochs_per_trial", type=int, default=10)
     p.add_argument("--max_batches_per_epoch", type=int, default=128)
-    p.add_argument("--study_name", default="gaze_mamba_search")
+    p.add_argument("--study_name", default="gaze_mamba_search_only_mfcw")
     p.add_argument("--storage", default=None)
 
     return p
 
 
+# Hardcoded fallback exclude lists (used when --exclude_* is not set via CLI
+# or config file).
+_DEFAULT_EXCLUDE_PARTICIPANTS_TRAIN = ["P01", "P02"]
+_DEFAULT_EXCLUDE_STIMULI_TRAIN = ["22", "23"]
+_DEFAULT_EXCLUDE_TRIALS_TRAIN = ["", "4", "5"]
+_DEFAULT_EXCLUDE_PARTICIPANTS_SEARCH = [
+    "P01",
+    "P02",
+    "P03",
+    "P04",
+    "P05",
+    "P06",
+    "P07",
+    "P08",
+    "001",
+    "002",
+]
+_DEFAULT_EXCLUDE_STIMULI_SEARCH = ["22", "23"]
+_DEFAULT_EXCLUDE_TRIALS_SEARCH = ["", "2", "4", "5"]
+
+
 def main():
-    args = _build_parser().parse_args()
+    p = _build_parser()
+
+    # ── Two-pass parse: peek at --config → set file defaults → full parse ─
+    pre, _ = p.parse_known_args()
+    model_config_override: dict = {}
+    if pre.config:
+        print(f"[config] loading {pre.config}")
+        cli_defaults, model_config_override = _load_config(pre.config)
+        valid_dests = {a.dest for a in p._actions}
+        applied = {k: v for k, v in cli_defaults.items() if k in valid_dests}
+        p.set_defaults(**applied)
+        print(
+            f"[config] applied {len(applied)} defaults from file"
+            + (
+                f", model_config keys: {list(model_config_override)}"
+                if model_config_override
+                else ""
+            )
+        )
+
+    args = p.parse_args()
 
     if args.mode == "train":
+        # Model config: hardcoded base, updated by any config-file override
         model_config = {
             **ENCODER_CONFIGS["siglip"],
             "d_model": 128,
-            "n_layers": 4,
-            "n_mix": 4,
-            "image_embed_dim": 512,
+            "n_layers": 6,
+            "n_mix": 3,
+            "image_embed_dim": 256,
             "conditioning_mode": "initial_state",
             "freeze_encoder": True,
         }
+        model_config.update(model_config_override)
+
         accelerator = Accelerator()
         train_on_the_fly(
             model_config=model_config,
             dataset_name=args.datasets,
             root=args.root,
-            split_strategy="random",
+            split_strategy="participant",
             context_len=args.context_len,
             sampling_step=args.sampling_step,
             max_image_size=args.max_image_size,
@@ -890,9 +1034,21 @@ def main():
             resume_from=args.resume_from,
             use_wandb=args.use_wandb,
             accelerator=accelerator,
-            exclude_trials=["", "4", "5"],
-            exclude_participants=["P01", "P02", "P03", "P04", "P06", "P07", "P08"],
-            exclude_stimuli=None,
+            exclude_participants=(
+                args.exclude_participants
+                if args.exclude_participants is not None
+                else _DEFAULT_EXCLUDE_PARTICIPANTS_TRAIN
+            ),
+            exclude_stimuli=(
+                args.exclude_stimuli
+                if args.exclude_stimuli is not None
+                else _DEFAULT_EXCLUDE_STIMULI_TRAIN
+            ),
+            exclude_trials=(
+                args.exclude_trials
+                if args.exclude_trials is not None
+                else _DEFAULT_EXCLUDE_TRIALS_TRAIN
+            ),
         )
         accelerator.end_training()
 
@@ -911,18 +1067,21 @@ def main():
             log_dir=args.log_dir,
             storage=args.storage,
             use_wandb=args.use_wandb,
-            exclude_trials=["", "2", "4", "5"],
-            exclude_participants=[
-                "P01",
-                "P02",
-                "P03",
-                "P04",
-                "P05",
-                "P06",
-                "P07",
-                "P08",
-            ],
-            exclude_stimuli=None,
+            exclude_participants=(
+                args.exclude_participants
+                if args.exclude_participants is not None
+                else _DEFAULT_EXCLUDE_PARTICIPANTS_SEARCH
+            ),
+            exclude_stimuli=(
+                args.exclude_stimuli
+                if args.exclude_stimuli is not None
+                else _DEFAULT_EXCLUDE_STIMULI_SEARCH
+            ),
+            exclude_trials=(
+                args.exclude_trials
+                if args.exclude_trials is not None
+                else _DEFAULT_EXCLUDE_TRIALS_SEARCH
+            ),
         )
 
 

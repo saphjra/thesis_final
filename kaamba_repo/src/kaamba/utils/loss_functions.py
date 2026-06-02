@@ -9,7 +9,8 @@ def gaussian_nll(mu, sigma, target):
     print(mu)
     dist = torch.distributions.Normal(mu, sigma)
     print("dist", dist)
-    nll = -dist.log_prob(target).sum(-1).mean()
+    nll = -dist
+
     print(nll)
     total_loss = nll
     return total_loss

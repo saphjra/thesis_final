@@ -62,6 +62,7 @@ ENCODER_CONFIGS = {
     },
 }
 
+
 # Maps the short encoder_type names used in Optuna suggestions to their default
 # HuggingFace model names.  ResNet is absent — it loads ImageNet weights via
 # torchvision and does not accept a model_name argument.
@@ -69,8 +70,6 @@ _ENCODER_MODEL_NAMES = {
     "vit": "google/vit-base-patch16-224",
     "siglip": "google/siglip-base-patch16-224",
 }
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -104,12 +103,12 @@ def _ce_loss(
     Summed cross-entropy over both axes.
 
     Args:
-        logits_x / logits_y: (B, T, n_bins)
-        x_bins   / y_bins:   (B, T)   LongTensor
+        logits_x / logits_y: (B, n_bins, T)  — model output (class dim first)
+        x_bins   / y_bins:   (B, T)           LongTensor of bin indices
     """
-    # F.cross_entropy expects (B, C, T) and (B, T)
-    loss_x = F.cross_entropy(logits_x.transpose(1, 2), x_bins)
-    loss_y = F.cross_entropy(logits_y.transpose(1, 2), y_bins)
+    # F.cross_entropy expects (B, C, T) logits and (B, T) targets — already correct
+    loss_x = F.cross_entropy(logits_x, x_bins)
+    loss_y = F.cross_entropy(logits_y, y_bins)
     return loss_x + loss_y
 
 
@@ -400,8 +399,8 @@ def train_categorical(
     root: str,
     split_strategy: str = "participant",
     train_ratio: float = 0.80,
-    val_ratio: float = 0.2,
-    test_ratio: float = 0.0,
+    val_ratio: float = 0.1,
+    test_ratio: float = 0.1,
     exclude_participants: Optional[List] = None,
     exclude_stimuli: Optional[List] = None,
     exclude_trials: Optional[List] = None,
@@ -818,19 +817,97 @@ def run_hparam_search_categorical(
 # ---------------------------------------------------------------------------
 
 
-def _build_parser():
-    p = argparse.ArgumentParser()
+def _load_config(path: str) -> Tuple[dict, dict]:
+    """
+    Load a JSON config file and return ``(cli_overrides, model_config)``.
+    Identical logic to unified_training._load_config — see that docstring.
+    """
+    data: dict = json.loads(Path(path).read_text())
+
+    if {"number", "value", "params"} <= data.keys():
+        params = dict(data["params"])
+        _MODEL_KEYS = {
+            "encoder_type",
+            "d_model",
+            "n_layers",
+            "n_mix",
+            "n_bins",
+            "image_embed_dim",
+            "conditioning_mode",
+            "freeze_encoder",
+        }
+        model_cfg = {k: v for k, v in params.items() if k in _MODEL_KEYS}
+        cli = {k: v for k, v in params.items() if k not in _MODEL_KEYS}
+        return cli, model_cfg
+
+    if "model_config" in data or "dataset_names" in data:
+        model_cfg = data.pop("model_config", {})
+        _SKIP = {
+            "run_name",
+            "run_id",
+            "trial_number",
+            "split_strategy",
+            "train_ratio",
+            "val_ratio",
+            "test_ratio",
+            "stride",
+        }
+        _KEY_MAP = {"dataset_names": "datasets"}
+        cli = {_KEY_MAP.get(k, k): v for k, v in data.items() if k not in _SKIP}
+        return cli, model_cfg
+
+    model_cfg = data.pop("model_config", {})
+    return data, model_cfg
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="Kaamba categorical gaze predictor — training & hparam search",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Config file (--config):
+  Pass any JSON file produced by this script to reproduce a run.
+  CLI flags always override the file.
+
+  config.json       saved per run by ExperimentConfig  (recommended)
+  best_trial.json   Optuna best-trial summary
+  plain JSON        hand-written file with CLI-style keys
+
+  Examples:
+    python categorical_training.py --config logs/trial_0012/config.json
+    python categorical_training.py --config best_trial.json --num_epochs 200
+""",
+    )
+    p.add_argument(
+        "--config",
+        default=None,
+        metavar="PATH",
+        help="JSON config file.  Keys override defaults; CLI flags override file.",
+    )
     p.add_argument("--mode", choices=["train", "search"], default="train")
 
-    p.add_argument("--datasets", nargs="+", default=["mcfw-gaze", "GGTG"])
+    # ── shared data args ──────────────────────────────────────────────────
+    p.add_argument("--datasets", nargs="+", default=["mcfw-gaze"])
     p.add_argument("--root", default="/home/janhof/thesis/data/")
     p.add_argument("--log_dir", default="/home/janhof/thesis/logs/runs_categorical")
     p.add_argument("--context_len", type=int, default=32)
     p.add_argument("--sampling_step", type=int, default=1)
     p.add_argument("--max_image_size", type=int, default=224)
     p.add_argument("--num_workers", type=int, default=1)
+    p.add_argument(
+        "--exclude_participants",
+        nargs="*",
+        default=None,
+        help="Participant IDs to exclude.  Overrides the hardcoded list.",
+    )
+    p.add_argument(
+        "--exclude_stimuli", nargs="*", default=None, help="Stimulus IDs to exclude."
+    )
+    p.add_argument(
+        "--exclude_trials", nargs="*", default=None, help="Trial IDs to exclude."
+    )
 
-    # train-only
+    # ── train-only ────────────────────────────────────────────────────────
     p.add_argument("--num_epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=1024)
     p.add_argument("--lr", type=float, default=0.00047323940014353053)
@@ -841,7 +918,7 @@ def _build_parser():
     p.add_argument("--resume_from", default=None)
     p.add_argument("--use_wandb", action="store_true")
 
-    # search-only
+    # ── search-only ───────────────────────────────────────────────────────
     p.add_argument("--n_trials", type=int, default=50)
     p.add_argument("--n_epochs_per_trial", type=int, default=10)
     p.add_argument("--max_batches_per_epoch", type=int, default=128)
@@ -851,8 +928,58 @@ def _build_parser():
     return p
 
 
+_DEFAULT_EXCLUDE_PARTICIPANTS_TRAIN = [
+    "P01",
+    "P02",
+    "P03",
+    "P04",
+    "P06",
+    "P07",
+    "P08",
+    "001",
+    "002",
+    "003",
+    "004",
+    "005",
+]
+_DEFAULT_EXCLUDE_STIMULI_TRAIN = None
+_DEFAULT_EXCLUDE_TRIALS_TRAIN = ["", "1", "2", "4", "5"]
+_DEFAULT_EXCLUDE_PARTICIPANTS_SEARCH = [
+    "P01",
+    "P02",
+    "P03",
+    "P04",
+    "P05",
+    "P06",
+    "P07",
+    "P08",
+]
+_DEFAULT_EXCLUDE_STIMULI_SEARCH = None
+_DEFAULT_EXCLUDE_TRIALS_SEARCH = ["", "2", "4", "5"]
+
+
 def main():
-    args = _build_parser().parse_args()
+    p = _build_parser()
+
+    # ── Two-pass parse: peek at --config → set file defaults → full parse ─
+    pre, _ = p.parse_known_args()
+    model_config_override: dict = {}
+    if pre.config:
+        print(f"[config] loading {pre.config}")
+        cli_defaults, model_config_override = _load_config(pre.config)
+        valid_dests = {a.dest for a in p._actions}
+        applied = {k: v for k, v in cli_defaults.items() if k in valid_dests}
+        p.set_defaults(**applied)
+        print(
+            f"[config] applied {len(applied)} defaults from file"
+            + (
+                f", model_config keys: {list(model_config_override)}"
+                if model_config_override
+                else ""
+            )
+        )
+
+    args = p.parse_args()
 
     if args.mode == "train":
         model_config = {
@@ -864,12 +991,14 @@ def main():
             "conditioning_mode": "initial_state",
             "freeze_encoder": True,
         }
+        model_config.update(model_config_override)
+
         accelerator = Accelerator()
         train_categorical(
             model_config=model_config,
             dataset_name=args.datasets,
             root=args.root,
-            split_strategy="random",
+            split_strategy="participant",
             context_len=args.context_len,
             sampling_step=args.sampling_step,
             max_image_size=args.max_image_size,
@@ -884,9 +1013,21 @@ def main():
             resume_from=args.resume_from,
             use_wandb=args.use_wandb,
             accelerator=accelerator,
-            exclude_trials=["", "4", "5"],
-            exclude_participants=["P01", "P02", "P03", "P04", "P06", "P07", "P08"],
-            exclude_stimuli=None,
+            exclude_participants=(
+                args.exclude_participants
+                if args.exclude_participants is not None
+                else _DEFAULT_EXCLUDE_PARTICIPANTS_TRAIN
+            ),
+            exclude_stimuli=(
+                args.exclude_stimuli
+                if args.exclude_stimuli is not None
+                else _DEFAULT_EXCLUDE_STIMULI_TRAIN
+            ),
+            exclude_trials=(
+                args.exclude_trials
+                if args.exclude_trials is not None
+                else _DEFAULT_EXCLUDE_TRIALS_TRAIN
+            ),
         )
         accelerator.end_training()
 
@@ -905,18 +1046,21 @@ def main():
             log_dir=args.log_dir,
             storage=args.storage,
             use_wandb=args.use_wandb,
-            exclude_trials=["", "2", "4", "5"],
-            exclude_participants=[
-                "P01",
-                "P02",
-                "P03",
-                "P04",
-                "P05",
-                "P06",
-                "P07",
-                "P08",
-            ],
-            exclude_stimuli=None,
+            exclude_participants=(
+                args.exclude_participants
+                if args.exclude_participants is not None
+                else _DEFAULT_EXCLUDE_PARTICIPANTS_SEARCH
+            ),
+            exclude_stimuli=(
+                args.exclude_stimuli
+                if args.exclude_stimuli is not None
+                else _DEFAULT_EXCLUDE_STIMULI_SEARCH
+            ),
+            exclude_trials=(
+                args.exclude_trials
+                if args.exclude_trials is not None
+                else _DEFAULT_EXCLUDE_TRIALS_SEARCH
+            ),
         )
 
 

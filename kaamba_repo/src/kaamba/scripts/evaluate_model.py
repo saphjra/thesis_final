@@ -2,36 +2,50 @@
 evaluate_model.py
 
 Loads a pymovements dataset, iterates over gaze objects per stimulus,
-generates matching synthetic sequences from a trained model, and computes
-all GazeEvaluator metrics — both per-stimulus and aggregated.
+generates matching synthetic sequences from a *sequence generator*, and
+computes all GazeEvaluator metrics — both per-stimulus and aggregated.
 
-Usage:
-    python evaluate_model.py \
-        --checkpoint  /path/to/best_model.pt \
-        --dataset     mcfw-gaze \
-        --root        /home/janhof/thesis/data \
-        --out_dir     /home/janhof/thesis/eval \
-        --split       test          # participant split to use
-        --n_generate  50            # synthetic sequences per stimulus
-        --seed_len    10
-        --gen_len     128
+Three built-in generators
+──────────────────────────
+  GMMModelGenerator          load a trained GMM  checkpoint (kaamba.py)
+  CategoricalModelGenerator  load a trained categorical checkpoint
+  SyntheticGenerator         generate step-function synthetic gaze
 
-Output:
-    <out_dir>/
-    ├── per_stimulus/
-    │   ├── <stimulus_name>.json     ← full metrics for each stimulus
-    │   └── ...
-    ├── aggregate.json               ← metrics averaged over all stimuli
-    └── eval_report.txt              ← human-readable summary
+Usage
+─────
+  # GMM model
+  python evaluate_model.py model \
+      --checkpoint /path/best_model.pt --dataset mcfw-gaze --root /data
+
+  # Categorical model
+  python evaluate_model.py categorical \
+      --checkpoint /path/best_cat.pt   --dataset mcfw-gaze --root /data
+
+  # Synthetic baseline
+  python evaluate_model.py synthetic \
+      --dataset mcfw-gaze --root /data --noise 15
+
+  # Side-by-side comparison (model vs synthetic, or two checkpoints)
+  python evaluate_model.py compare \
+      --checkpoint /path/model.pt --also_synthetic \
+      --dataset mcfw-gaze --root /data
+
+Output (each generator writes to its own sub-directory):
+    <out_dir>/<generator_name>/
+    ├── per_stimulus/<stimulus>.json
+    ├── aggregate.json
+    └── eval_report.txt
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
+from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import polars as pl
@@ -41,140 +55,383 @@ from scipy.ndimage import gaussian_filter
 from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
-# Project imports  (adjust paths to your package layout if needed)
+# Project imports
 # ---------------------------------------------------------------------------
 from kaamba.net.models.kaamba import build_gaze_predictor
-from kaamba.utils.gaze_eval import GazeEvaluator, generate_sequences
+from kaamba.net.models.kaamba_categorical import (
+    build_categorical_gaze_predictor,
+)
 
 
 # ---------------------------------------------------------------------------
-# Helpers: event extraction via pymovements
+# Sequence generator abstraction
 # ---------------------------------------------------------------------------
-def _gaze_obj_to_arrays(
-    gaze,
-    vel_method: str = "fivepoint",
-    vel_threshold: float = 30.0,  # deg/s — rescaled below if needed
-    min_fix_dur: int = 10,
-    screen_w_deg: float = 36.0,  # used for threshold rescaling only
-    screen_h_deg: float = 20.0,
-):
-    px_arr = np.stack(gaze.samples["pixel"].to_numpy())  # (T, 2)
 
-    # Detect whether coordinates are already normalised
-    is_normalised = px_arr.max() <= 2.0  # >2.0 = definitely pixel space
-    screen = gaze.experiment.screen
-    if is_normalised:
-        # Already in [0,1] — convert to degrees for IVT
-        # so velocity units are consistent with the threshold
 
-        pos_arr = np.stack(
-            [
-                px_arr[:, 0] * screen_w_deg,
-                px_arr[:, 1] * screen_h_deg,
-            ],
-            axis=1,
+class SequenceGenerator(ABC):
+    """
+    Abstract interface for anything that produces ``(N, gen_len, 2)``
+    normalised gaze sequences.  The evaluation loop calls ``generate()``
+    once per stimulus and treats the return value as the "fake" pool.
+    """
+
+    name: str = "unnamed"
+
+    @abstractmethod
+    def generate(
+        self,
+        img_path: Optional[Path],
+        n: int,
+        gen_len: int,
+        seed_len: int,
+        experiment,  # pm.gaze.Experiment — carries screen / sr info
+        device: str = "cpu",
+    ) -> np.ndarray:
+        """Return (N, gen_len, 2) float32 array of normalised gaze in [0,1]."""
+
+
+def generate_sequences(
+    model,
+    images,  # torch.Tensor (N, 3, H, W)
+    seed_len: int = 10,
+    gen_len: int = 200,
+    temperature: float = 1.0,
+    device: str = "cuda",
+) -> np.ndarray:
+    """
+    Autoregressively sample from a trained GazePredictor.
+    Returns (N, gen_len, 2) numpy array in normalised [0,1].
+    """
+    import torch
+
+    model.eval()
+    N = images.shape[0]
+    images = images.to(device)
+    generated = torch.full((N, 2, seed_len), 0.5, device=device)
+
+    with torch.no_grad():
+        for _ in range(gen_len - seed_len):
+            pi, mu, log_sx, log_sy, rho_raw = model(images, generated)
+            pi_t = torch.softmax(pi[:, -1, :], dim=-1)  # (N, K)
+            mu_t = mu[:, -1, :, :]  # (N, K, 2)
+            sx_t = log_sx[:, -1, :].exp().clamp(1e-4) * temperature
+            sy_t = log_sy[:, -1, :].exp().clamp(1e-4) * temperature
+            rho_t = torch.tanh(rho_raw[:, -1, :]) * 0.99
+
+            k_idx = torch.multinomial(pi_t, 1).squeeze(-1)  # (N,)
+            mu_k = mu_t[torch.arange(N), k_idx]  # (N, 2)
+            sx_k = sx_t[torch.arange(N), k_idx]
+            sy_k = sy_t[torch.arange(N), k_idx]
+            rho_k = rho_t[torch.arange(N), k_idx]
+
+            z1 = torch.randn(N, device=device)
+            z2 = torch.randn(N, device=device)
+            x_t = mu_k[:, 0] + sx_k * z1
+            y_t = mu_k[:, 1] + sy_k * (rho_k * z1 + (1 - rho_k**2).sqrt() * z2)
+
+            new_pt = torch.stack([x_t, y_t], dim=1).unsqueeze(-1)
+            generated = torch.cat([generated, new_pt], dim=-1)
+
+    return generated.permute(0, 2, 1).cpu().numpy()  # (N, T, 2)
+
+
+# ── GMM model (kaamba.py) ────────────────────────────────────────────────────
+
+
+class GMMModelGenerator(SequenceGenerator):
+    """Load a trained GMM checkpoint and generate via bivariate Gaussian sampling."""
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        temperature: float = 1.0,
+        device: str = "cpu",
+        label: Optional[str] = None,
+    ):
+        self.device = device
+        self.temperature = temperature
+        ckpt = torch.load(checkpoint_path, map_location=device)
+        model_config = ckpt["config"]["model_config"]
+        self.model = build_gaze_predictor(**model_config, verbose=False)
+        self.model.load_state_dict(ckpt["model_state_dict"])
+        self.model = self.model.to(device).eval()
+        run_name = Path(checkpoint_path).parent.parent.name
+        self.name = label or f"gmm_{run_name}"
+        print(
+            f"[{self.name}] loaded GMM model "
+            f"({sum(p.numel() for p in self.model.parameters()):,} params)"
         )
-        norm_arr = px_arr  # already normalised
-    else:
-        # Raw pixels — use pymovements pix2deg
-        gaze.pix2deg()
-        pos_arr = np.stack(gaze.samples["position"].to_numpy())
-        norm_arr = np.stack(
-            [
-                px_arr[:, 0] / screen.width_px,
-                px_arr[:, 1] / screen.height_px,
-            ],
-            axis=1,
+
+    def generate(self, img_path, n, gen_len, seed_len, experiment, device=None):
+        device = device or self.device
+        img_tensor = _load_image_tensor(img_path, device)  # (1, 3, 224, 224)
+        imgs_batch = img_tensor.expand(n, -1, -1, -1)
+        with torch.no_grad():
+            return generate_sequences(
+                model=self.model,
+                images=imgs_batch,
+                seed_len=seed_len,
+                gen_len=gen_len,
+                temperature=self.temperature,
+                device=device,
+            )  # (N, gen_len, 2)
+
+
+# ── Categorical model (kaamba_categorical.py) ────────────────────────────────
+
+
+class CategoricalModelGenerator(SequenceGenerator):
+    """Load a trained categorical checkpoint and generate via multinomial sampling."""
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        temperature: float = 1.0,
+        device: str = "cpu",
+        label: Optional[str] = None,
+    ):
+        self.device = device
+        self.temperature = temperature
+        ckpt = torch.load(checkpoint_path, map_location=device)
+        model_config = ckpt["config"]["model_config"]
+        self.model = build_categorical_gaze_predictor(**model_config, verbose=False)
+        self.model.load_state_dict(ckpt["model_state_dict"])
+        self.model = self.model.to(device).eval()
+        self.n_bins = self.model.n_bins
+        run_name = Path(checkpoint_path).parent.parent.name
+        self.name = label or f"categorical_{run_name}"
+        print(
+            f"[{self.name}] loaded categorical model "
+            f"(n_bins={self.n_bins}, "
+            f"{sum(p.numel() for p in self.model.parameters()):,} params)"
         )
 
-    # Compute velocity in deg/s from pos_arr (now always in degrees)
-    sr = gaze.experiment.sampling_rate
-    vel_arr = np.diff(pos_arr, axis=0) * sr  # (T-1, 2) deg/s
-    vel_arr = np.concatenate([vel_arr[:1], vel_arr])  # (T, 2) pad first
-    vel_arr = np.nan_to_num(vel_arr, nan=0.0)
+    def generate(self, img_path, n, gen_len, seed_len, experiment, device=None):
+        device = device or self.device
+        n_bins = self.n_bins
+        temp = self.temperature
+        img_t = _load_image_tensor(img_path, device).expand(n, -1, -1, -1)
+        seq = torch.full((n, 2, seed_len), 0.5, device=device)
 
-    T = len(pos_arr)
-    timesteps = np.arange(T, dtype=int)
+        with torch.no_grad():
+            for _ in range(gen_len - seed_len):
+                lx, ly = self.model(img_t, seq)  # each (N, n_bins, T)
+                # last-step logits → (N, n_bins)
+                px = (lx[:, :, -1] / temp).softmax(dim=1)
+                py = (ly[:, :, -1] / temp).softmax(dim=1)
+                xb = torch.multinomial(px, 1).squeeze(1).float()
+                yb = torch.multinomial(py, 1).squeeze(1).float()
+                xc = (xb + 0.5) / n_bins
+                yc = (yb + 0.5) / n_bins
+                nxt = torch.stack([xc, yc], dim=1).unsqueeze(2)  # (N,2,1)
+                seq = torch.cat([seq, nxt], dim=2)
 
-    fix_events = pm.events.ivt(
-        vel_arr,
-        timesteps=timesteps,
-        velocity_threshold=vel_threshold,  # deg/s — now valid
-        minimum_duration=min_fix_dur,
-    )
-    sac_events = pm.events.fill(fix_events, timesteps=timesteps, name="saccade")
-
-    return pos_arr, vel_arr, norm_arr, fix_events, sac_events
+        return seq.permute(0, 2, 1).cpu().numpy()  # (N, T, 2)
 
 
-def _enrich_saccades(sac_events, pos_arr, vel_arr):
-    rows = []
-    for row in sac_events.frame.iter_rows(named=True):
-        seg_pos = pos_arr[row["onset"] : row["offset"]]
-        seg_vel = vel_arr[row["onset"] : row["offset"]]
-        if len(seg_pos) == 0:  # skip degenerate events
-            continue
-        amp = (
-            float(np.linalg.norm(seg_pos[-1] - seg_pos[0])) if len(seg_pos) > 1 else 0.0
-        )
-        pv = float(np.linalg.norm(seg_vel, axis=1).max()) if len(seg_vel) > 0 else 0.0
-        angle = (
-            float(
-                np.arctan2(
-                    seg_pos[-1, 1] - seg_pos[0, 1],
-                    seg_pos[-1, 0] - seg_pos[0, 0],
+# ── Synthetic step-function baseline ─────────────────────────────────────────
+
+
+class SyntheticGenerator(SequenceGenerator):
+    """
+    Generate synthetic gaze using pm.synthetic.step_function.
+    Screen dimensions and sampling rate are taken from the experiment object
+    passed at generation time (extracted from the real dataset).
+    """
+
+    def __init__(
+        self,
+        fix_dur_mean_ms: float = 250.0,
+        fix_dur_std_ms: float = 80.0,
+        sac_dur_mean_ms: float = 40.0,
+        sac_dur_std_ms: float = 15.0,
+        noise: float = 0.5,
+        values_spread: float = 0.7,
+        start_value: Optional[tuple] = None,
+        values_center: Optional[tuple] = None,
+        seed: int = 42,
+        label: Optional[str] = None,
+    ):
+        self.fix_mean = fix_dur_mean_ms
+        self.fix_std = fix_dur_std_ms
+        self.sac_mean = sac_dur_mean_ms
+        self.sac_std = sac_dur_std_ms
+        self.noise = noise
+        self.spread = values_spread
+        self.start = start_value
+        self.center = values_center
+        self.seed = seed
+        self.name = label or "synthetic"
+
+    def generate(self, img_path, n, gen_len, seed_len, experiment, device=None):
+        screen = experiment.screen
+        sr = float(experiment.sampling_rate)
+        sw = int(screen.width_px)
+        sh = int(screen.height_px)
+
+        cx, cy = self.center or (sw / 2, sh / 2)
+        start = self.start or (sw / 2, sh / 2)
+        half_w = sw / 2 * self.spread
+        half_h = sh / 2 * self.spread
+
+        rng = np.random.default_rng(self.seed)
+        seqs = []
+
+        def _ms2s(ms):
+            return max(1, int(round(ms * sr / 1000)))
+
+        for _ in range(n):
+            steps, values, cursor = [], [], 0
+            while cursor < gen_len:
+                fd = max(
+                    _ms2s(self.fix_mean * 0.3),
+                    int(rng.normal(_ms2s(self.fix_mean), _ms2s(self.fix_std))),
                 )
-            )
-            if len(seg_pos) > 1
-            else float("nan")
-        )
-        rows.append(
-            {**row, "amplitude_deg": amp, "peak_vel_deg_s": pv, "angle_rad": angle}
-        )
-    return (
-        pl.DataFrame(rows)
-        if rows
-        else pl.DataFrame(
-            schema={
-                "name": pl.Utf8,
-                "onset": pl.Int64,
-                "offset": pl.Int64,
-                "duration": pl.Int64,
-                "amplitude_deg": pl.Float64,
-                "peak_vel_deg_s": pl.Float64,
-                "angle_rad": pl.Float64,
-            }
-        )
-    )
+                x = float(np.clip(rng.uniform(cx - half_w, cx + half_w), 0, sw))
+                y = float(np.clip(rng.uniform(cy - half_h, cy + half_h), 0, sh))
+                steps.append(cursor)
+                values.append((x, y))
+                cursor += fd
+                if cursor >= gen_len:
+                    break
+                sd = max(1, int(rng.normal(_ms2s(self.sac_mean), _ms2s(self.sac_std))))
+                nx = float(np.clip(rng.uniform(cx - half_w, cx + half_w), 0, sw))
+                ny = float(np.clip(rng.uniform(cy - half_h, cy + half_h), 0, sh))
+                steps.append(cursor)
+                values.append(((x + nx) / 2, (y + ny) / 2))
+                cursor += sd
+
+            pairs = [(s, v) for s, v in zip(steps, values) if s < gen_len]
+            if not pairs:
+                pairs = [(0, (sw / 2, sh / 2))]
+            s_list, v_list = zip(*pairs)
+
+            pos = pm.synthetic.step_function(
+                length=gen_len,
+                steps=list(s_list),
+                values=list(v_list),
+                start_value=start,
+                noise=self.noise,
+            )  # (gen_len, 2) in pixels
+            norm = np.stack([pos[:, 0] / sw, pos[:, 1] / sh], axis=1)
+            seqs.append(norm.astype(np.float32))
+
+        return np.stack(seqs)  # (N, gen_len, 2)
 
 
-def _enrich_fixations(fix_events, pos_arr):
-    rows = []
-    for row in fix_events.frame.iter_rows(named=True):
+# ── Image loading helper ─────────────────────────────────────────────────────
+
+
+def _load_image_tensor(img_path: Path, device: str) -> torch.Tensor:
+    """Load and resize an image to (1, 3, 224, 224)."""
+    import torchvision.transforms.functional as TF
+    from PIL import Image
+
+    img = Image.open(img_path).convert("RGB")
+    return TF.to_tensor(TF.resize(img, [224, 224])).unsqueeze(0).to(device)
+
+
+# ---------------------------------------------------------------------------
+# pymovements-native preprocessing helpers
+# ---------------------------------------------------------------------------
+
+_EMPTY_FIX = pl.DataFrame(
+    schema={
+        "name": pl.Utf8,
+        "onset": pl.Int64,
+        "offset": pl.Int64,
+        "duration": pl.Int64,
+        "cx_deg": pl.Float64,
+        "cy_deg": pl.Float64,
+    }
+)
+_EMPTY_SAC = pl.DataFrame(
+    schema={
+        "name": pl.Utf8,
+        "onset": pl.Int64,
+        "offset": pl.Int64,
+        "duration": pl.Int64,
+        "amplitude_deg": pl.Float64,
+        "peak_vel_deg_s": pl.Float64,
+        "angle_rad": pl.Float64,
+    }
+)
+
+
+def _fix_df_from_events(ev_frame: pl.DataFrame, pos_arr: np.ndarray) -> pl.DataFrame:
+    """
+    Filter fixation events from a preprocessed events DataFrame and append
+    centroid columns ``cx_deg`` / ``cy_deg`` (mean deg position per fixation).
+
+    ``pos_arr`` must be (T, 2) in degrees of visual angle — taken from
+    ``gaze.samples["position"]`` after ``pix2deg()``.
+    """
+    if ev_frame is None or len(ev_frame) == 0:
+        return _EMPTY_FIX
+    fix = ev_frame.filter(pl.col("name") == "fixation")
+    if len(fix) == 0:
+        return _EMPTY_FIX
+    cx_list, cy_list = [], []
+    for row in fix.iter_rows(named=True):
         seg = pos_arr[row["onset"] : row["offset"]]
-        if len(seg) == 0:  # skip degenerate zero-length events
-            continue
-        rows.append(
-            {
-                **row,
-                "cx_deg": float(seg[:, 0].mean()),
-                "cy_deg": float(seg[:, 1].mean()),
-            }
-        )
-    return (
-        pl.DataFrame(rows)
-        if rows
-        else pl.DataFrame(
-            schema={
-                "name": pl.Utf8,
-                "onset": pl.Int64,
-                "offset": pl.Int64,
-                "duration": pl.Int64,
-                "cx_deg": pl.Float64,
-                "cy_deg": pl.Float64,
-            }
-        )
+        if len(seg) == 0:
+            cx_list.append(float("nan"))
+            cy_list.append(float("nan"))
+        else:
+            cx_list.append(float(seg[:, 0].mean()))
+            cy_list.append(float(seg[:, 1].mean()))
+    result = fix.with_columns(
+        [
+            pl.Series("cx_deg", cx_list, dtype=pl.Float64),
+            pl.Series("cy_deg", cy_list, dtype=pl.Float64),
+        ]
     )
+    # Keep only the columns downstream code expects (drops dispersion etc.)
+    keep = ["name", "onset", "offset", "duration", "cx_deg", "cy_deg"]
+    return result.select([c for c in keep if c in result.columns])
+
+
+def _sac_df_from_events(ev_frame: pl.DataFrame, pos_arr: np.ndarray) -> pl.DataFrame:
+    """
+    Filter saccade events, append saccade direction ``angle_rad``, and rename
+    ``amplitude`` → ``amplitude_deg``  /  ``peak_velocity`` → ``peak_vel_deg_s``
+    to match the ``evaluate_stimulus()`` column expectations.
+
+    ``amplitude`` and ``peak_velocity`` must already be present — they are
+    added by ``compute_event_properties(["amplitude", "peak_velocity", ...])``.
+    """
+    if ev_frame is None or len(ev_frame) == 0:
+        return _EMPTY_SAC
+    sac = ev_frame.filter(pl.col("name") == "saccade")
+    if len(sac) == 0:
+        return _EMPTY_SAC
+    angle_list = []
+    for row in sac.iter_rows(named=True):
+        seg = pos_arr[row["onset"] : row["offset"]]
+        if len(seg) > 1:
+            angle_list.append(
+                float(np.arctan2(seg[-1, 1] - seg[0, 1], seg[-1, 0] - seg[0, 0]))
+            )
+        else:
+            angle_list.append(float("nan"))
+    result = sac.with_columns(pl.Series("angle_rad", angle_list, dtype=pl.Float64))
+    rename = {}
+    if "amplitude" in result.columns:
+        rename["amplitude"] = "amplitude_deg"
+    if "peak_velocity" in result.columns:
+        rename["peak_velocity"] = "peak_vel_deg_s"
+    if rename:
+        result = result.rename(rename)
+    keep = [
+        "name",
+        "onset",
+        "offset",
+        "duration",
+        "amplitude_deg",
+        "peak_vel_deg_s",
+        "angle_rad",
+    ]
+    return result.select([c for c in keep if c in result.columns])
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +446,6 @@ def evaluate_stimulus(
     real_sac_df: pl.DataFrame,  # enriched saccade frame  (real)
     fake_fix_df: pl.DataFrame,  # enriched fixation frame (fake)
     fake_sac_df: pl.DataFrame,  # enriched saccade frame  (fake)
-    evaluator: GazeEvaluator,
 ) -> Dict:
     """Run all metrics for one stimulus, using pre-extracted event frames."""
     from scipy import stats
@@ -398,7 +654,7 @@ def evaluate_stimulus(
 
 
 def run_evaluation(
-    checkpoint_path: str,
+    generator: SequenceGenerator,
     dataset_name: str,
     root: str,
     out_dir: str,
@@ -406,44 +662,37 @@ def run_evaluation(
     n_generate: int = 50,
     seed_len: int = 10,
     gen_len: int = 128,
-    temperature: float = 1.0,
     vel_threshold: float = 30.0,  # deg/s IVT threshold
-    min_fix_duration: int = 10,  # samples
+    min_fix_duration: int = 100,  # samples
+    dispersion_threshold: float = 1.0,  # deg, for I-DT fixation detection
     vel_method: str = "fivepoint",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
-):
+) -> Dict:
     """
     Main evaluation loop.
 
+    Accepts any SequenceGenerator (GMMModelGenerator, CategoricalModelGenerator,
+    or SyntheticGenerator) and writes results to out_dir / generator.name /.
+
     For each (subject, stimulus) pair in the dataset:
       1. Load real gaze sequences
-      2. Load the matching stimulus image
-      3. Generate synthetic sequences from the model
-      4. Run all GazeEvaluator metrics
-      5. Save per-stimulus JSON + aggregate report
+      2. Call generator.generate() for the matching stimulus image
+      3. Run all  metrics
+      4. Save per-stimulus JSON + aggregate report
     """
-    out_dir = Path(out_dir)
+    out_dir = Path(out_dir) / generator.name
     stim_dir = out_dir / "per_stimulus"
     stim_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Load model ────────────────────────────────────────────────────────
-    print(f"[eval] Loading checkpoint: {checkpoint_path}")
-    ckpt = torch.load(checkpoint_path, map_location=device)
-
-    model_config = ckpt["config"]["model_config"]
-    model = build_gaze_predictor(**model_config, verbose=False)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model = model.to(device).eval()
-    print(
-        f"[eval] Model loaded  ({sum(p.numel() for p in model.parameters()):,} params)"
-    )
-
     # ── Load dataset ──────────────────────────────────────────────────────
-    print(f"\n[eval] Loading dataset: {dataset_name}")
+    print(f"\n[eval] Generator : {generator.name}")
+    print(f"[eval] Loading dataset: {dataset_name}")
     dataset_paths = pm.DatasetPaths(root=root)
     dataset = pm.Dataset(dataset_name, path=dataset_paths)
     dataset.scan()
     dataset.load(subset=subset)
+    if dataset_name == "GGTG":
+        dataset.split_gaze_data(by="stimulus")
 
     print(f"[eval] Loaded {len(dataset.gaze)} gaze files")
 
@@ -454,41 +703,40 @@ def run_evaluation(
     scr_w_px = screen.width_px
     scr_h_px = screen.height_px
 
-    # Degree extent for GazeEvaluator (needs origin set for dva)
-    try:
-        scr_w_deg = screen.x_max_dva - screen.x_min_dva
-        scr_h_deg = screen.y_max_dva - screen.y_min_dva
-    except TypeError:
-        # origin not set — fall back to rough estimate
-        scr_w_deg = 2 * np.degrees(
-            np.arctan(screen.width_cm / (2 * screen.distance_cm))
-        )
-        scr_h_deg = 2 * np.degrees(
-            np.arctan(screen.height_cm / (2 * screen.distance_cm))
-        )
-
+    # ── Preprocess entire dataset with pymovements built-ins ──────────────
+    # This runs once on the stored polars frames — no cloning, no manual
+    # numpy velocity computation.  After these calls every gaze object in
+    # dataset.gaze has  position  and  velocity  columns, and every entry in
+    # dataset.events has  fixation  and  saccade  rows with amplitude /
+    # dispersion / peak_velocity properties already populated.
     print(
-        f"[eval] Screen: {scr_w_px}×{scr_h_px}px  "
-        f"{scr_w_deg:.1f}×{scr_h_deg:.1f}°  sr={sr}Hz"
+        "[eval] Preprocessing: pix2deg → pos2vel → ID-T → microsaccades → "
+        "event properties …"
     )
 
-    evaluator = GazeEvaluator(
-        sample_rate_hz=sr,
-        screen_w_deg=scr_w_deg,
-        screen_h_deg=scr_h_deg,
-        vel_threshold=vel_threshold,
-        min_fix_duration=min_fix_duration,
-    )
+    dataset.pix2deg()
+    dataset.pos2vel(method=vel_method)
+    dataset.save_preprocessed()
 
-    # ── Group gaze objects by stimulus ───────────────────────────────────
-    # Each gaze object corresponds to one (subject, stimulus) recording.
-    # We group by stimulus so we can aggregate across subjects per image.
+    dataset.detect_events(
+        "idt",
+        dispersion_threshold=dispersion_threshold,
+        clear=True,
+        minimum_duration=min_fix_duration,
+    )
+    dataset.detect_events("fill")
+
+    dataset.compute_event_properties(["amplitude", "dispersion", "peak_velocity"])
+    dataset.save_events()
+    print(f"[eval] Preprocessing complete — {len(dataset.gaze)} recordings ready")
+
+    # ── Group gaze objects + event frames by stimulus ─────────────────────
     from collections import defaultdict
 
     by_stimulus = defaultdict(list)
-    for gaze in dataset.gaze:
+    for gaze, ev_frame in zip(dataset.gaze, dataset.events):
         stim = gaze.metadata.get("stimulus", "unknown")
-        by_stimulus[stim].append(gaze)
+        by_stimulus[stim].append((gaze, ev_frame))
 
     print(f"[eval] {len(by_stimulus)} unique stimuli\n")
 
@@ -523,43 +771,41 @@ def run_evaluation(
 
         # ── Collect real sequences ────────────────────────────────────────
         real_norm_seqs = []  # (T, 2) normalised, one per recording
-        all_real_fix = []  # enriched fixation DataFrames
-        all_real_sac = []  # enriched saccade DataFrames
+        all_real_fix = []  # fixation DataFrames
+        all_real_sac = []  # saccade DataFrames
 
-        for gaze in gaze_list:
-            # Clone so pix2deg/pos2vel don't mutate the stored object
-            g = gaze.clone()
+        for gaze, ev_frame in gaze_list:
             try:
-                pos_arr, vel_arr, norm_arr, fix_ev, sac_ev = _gaze_obj_to_arrays(
-                    g,
-                    vel_method=vel_method,
-                    vel_threshold=vel_threshold,
-                    min_fix_dur=min_fix_duration,
-                    screen_h_deg=scr_h_deg,
-                    screen_w_deg=scr_w_deg,
+                # position and pixel columns are already populated by the
+                # dataset-level preprocessing above — no clone, no copy.
+                px_raw = np.stack(gaze.samples["pixel"].to_numpy())  # (T,2) px
+                pos_arr = np.stack(gaze.samples["position"].to_numpy())  # (T,2) deg
+                norm_arr = np.column_stack(
+                    [px_raw[:, 0] / scr_w_px, px_raw[:, 1] / scr_h_px]
                 )
+                fix_df = _fix_df_from_events(ev_frame.frame, pos_arr)
+                sac_df = _sac_df_from_events(ev_frame.frame, pos_arr)
             except Exception as e:
                 print(
                     f"  [warn] {stim_name} / {gaze.metadata.get('subject_id')} "
-                    f"event detection failed: {e}"
+                    f"event extraction failed: {e}"
                 )
                 continue
 
             T_avail = len(norm_arr)
-            min_len = seed_len + gen_len
-            if T_avail < min_len:
+            if T_avail < seed_len + gen_len:
                 tqdm.write(
                     f"  [dbg] {stim_name}/{gaze.metadata.get('subject_id')}: "
-                    f"only {T_avail} samples, need {min_len} — skipping"
+                    f"only {T_avail} samples, need {seed_len + gen_len} — skipping"
                 )
                 continue
 
-            step = 1  # can be changed to step = max(1, gen_len // 2) if  with 50% stride for more samples per recording
+            step = max(1, gen_len // 2)  # 50 % overlap — richer real pool
             for start in range(0, T_avail - gen_len + 1, step):
                 real_norm_seqs.append(norm_arr[start : start + gen_len])
 
-            all_real_fix.append(_enrich_fixations(fix_ev, pos_arr))
-            all_real_sac.append(_enrich_saccades(sac_ev, pos_arr, vel_arr))
+            all_real_fix.append(fix_df)
+            all_real_sac.append(sac_df)
 
         if len(real_norm_seqs) == 0:
             print(f"  [skip] {stim_name}: no valid real sequences")
@@ -579,57 +825,46 @@ def run_evaluation(
             print(f"  [skip] {stim_name}: image file not found at {img_path}")
             continue
 
-        import torchvision.transforms.functional as TF
-        from PIL import Image
-
-        img = Image.open(img_path).convert("RGB")
-        img_tensor = (
-            TF.to_tensor(TF.resize(img, [224, 224])).unsqueeze(0).to(device)
-        )  # (1, 3, 224, 224)
-
-        # ── Generate synthetic sequences ──────────────────────────────────
-        # Repeat the image n_generate times
-        imgs_batch = img_tensor.expand(n_generate, -1, -1, -1)  # (N, 3, 224, 224)
-
-        with torch.no_grad():
-            fake_norm = generate_sequences(
-                model=model,
-                images=imgs_batch,
-                seed_len=seed_len,
-                gen_len=gen_len,
-                temperature=temperature,
-                device=device,
-            )  # (N, gen_len, 2)
+        # ── Generate sequences via generator ──────────────────────────────
+        fake_norm = generator.generate(
+            img_path=img_path,
+            n=n_generate,
+            gen_len=gen_len,
+            seed_len=seed_len,
+            experiment=first_gaze.experiment,
+            device=device,
+        )  # (N, gen_len, 2)
 
         # ── Extract events from fake sequences ────────────────────────────
         all_fake_fix = []
         all_fake_sac = []
 
-        for seq in fake_norm:
-            # Convert normalised → pixel → degrees for event detection
-            px_seq = seq * np.array([scr_w_px, scr_h_px])  # (T, 2) px
-            exp_obj = first_gaze.experiment
-
-            g_fake = pm.gaze.from_numpy(pixel=px_seq.T, experiment=exp_obj)
-            g_fake.pix2deg()
-            g_fake.pos2vel(method=vel_method)
-
-            pos_f = np.stack(g_fake.samples["position"].to_numpy())
-            vel_f = np.nan_to_num(
-                np.stack(g_fake.samples["velocity"].to_numpy()), nan=0.0
+        for seq in fake_norm:  # (gen_len, 2) normalised
+            px_vals = seq * np.array([scr_w_px, scr_h_px], dtype=float)
+            g_fake = pm.Gaze(
+                pl.DataFrame(
+                    {
+                        "x_pix": px_vals[:, 0],
+                        "y_pix": px_vals[:, 1],
+                    }
+                ),
+                pixel_columns=["x_pix", "y_pix"],
+                experiment=first_gaze.experiment,
             )
-            ts = np.arange(gen_len, dtype=int)
-
-            fix_f = pm.events.ivt(
-                vel_f,
-                timesteps=ts,
-                velocity_threshold=vel_threshold,
-                minimum_duration=min_fix_duration,
-            )
-            sac_f = pm.events.fill(fix_f, timesteps=ts, name="saccade")
-
-            all_fake_fix.append(_enrich_fixations(fix_f, pos_f))
-            all_fake_sac.append(_enrich_saccades(sac_f, pos_f, vel_f))
+            try:
+                g_fake.pix2deg()
+                g_fake.pos2vel(method=vel_method)
+                g_fake.detect("idt", clear=True, minimum_duration=100)
+                g_fake.detect("microsaccades", minimum_duration=3)
+                g_fake.compute_event_properties(
+                    ["amplitude", "dispersion", "peak_velocity"]
+                )
+                pos_f = np.stack(g_fake.samples["position"].to_numpy())
+                ev_df = g_fake.events.frame
+                all_fake_fix.append(_fix_df_from_events(ev_df, pos_f))
+                all_fake_sac.append(_sac_df_from_events(ev_df, pos_f))
+            except Exception as e:
+                tqdm.write(f"  [warn] fake event detection failed: {e}")
 
         fake_fix_df = pl.concat(all_fake_fix) if all_fake_fix else pl.DataFrame()
         fake_sac_df = pl.concat(all_fake_sac) if all_fake_sac else pl.DataFrame()
@@ -642,7 +877,6 @@ def run_evaluation(
             real_sac_df=real_sac_df,
             fake_fix_df=fake_fix_df,
             fake_sac_df=fake_sac_df,
-            evaluator=evaluator,
         )
         metrics["stimulus"] = stim_name
         metrics["time_s"] = time.time() - t0
@@ -1183,80 +1417,398 @@ def plot_best_worst_comparison(
 
 
 # ---------------------------------------------------------------------------
+# Multi-generator evaluation (comparison mode)
+# ---------------------------------------------------------------------------
+
+
+def _save_comparison_table(all_gen_results: Dict[str, Dict], out_path: Path) -> None:
+    """Write a side-by-side mean±std comparison table across all generators."""
+    key_metrics = [
+        ("fixation_duration", "ks_stat", "Fix duration KS "),
+        ("fixation_duration", "p_value", "Fix duration p   "),
+        ("saccade_amplitude", "ks_stat", "Sac amplitude KS "),
+        ("main_sequence", "fake_r", "Main sequence r  "),
+        ("fixation_density_map", "kl_divergence", "Fix density KL   "),
+        ("saccade_direction", "kl_divergence", "Sac direction KL "),
+        ("classifier_auc", "auc", "Classifier AUC   "),
+    ]
+
+    gen_names = list(all_gen_results.keys())
+    col_w = max(20, max(len(n) for n in gen_names) + 4)
+    header = f"  {'Metric':<22}" + "".join(f"  {n:^{col_w}}" for n in gen_names)
+    sep = "-" * len(header)
+
+    lines = [
+        "=" * len(header),
+        "GENERATOR COMPARISON",
+        "=" * len(header),
+        "",
+        header,
+        sep,
+    ]
+
+    for section, key, label in key_metrics:
+        row = f"  {label:<22}"
+        for gen_name in gen_names:
+            per_stim = all_gen_results[gen_name]
+            vals = [
+                m[section][key]
+                for m in per_stim.values()
+                if isinstance(m, dict)
+                and section in m
+                and isinstance(m[section], dict)
+                and isinstance(m[section].get(key), (int, float))
+            ]
+            arr = np.array([v for v in vals if not np.isnan(v)])
+            cell = f"{arr.mean():.4f} ±{arr.std():.4f}" if len(arr) else "n/a"
+            row += f"  {cell:^{col_w}}"
+        lines.append(row)
+
+    lines += ["", "=" * len(header)]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("\n".join(lines))
+    print(f"[compare] table → {out_path}")
+
+
+def run_multi_evaluation(
+    generators: List[SequenceGenerator],
+    dataset_name: str,
+    root: str,
+    out_dir: str,
+    **kwargs,
+) -> Dict[str, Dict]:
+    """
+    Run run_evaluation for every generator in ``generators`` and write a
+    cross-generator comparison table to ``out_dir/comparison.txt``.
+
+    Returns
+    -------
+    dict mapping generator.name → all_results dict from run_evaluation
+    """
+    all_gen_results: Dict[str, Dict] = {}
+    for gen in generators:
+        results = run_evaluation(gen, dataset_name, root, out_dir, **kwargs)
+        all_gen_results[gen.name] = results
+
+    _save_comparison_table(all_gen_results, Path(out_dir) / "comparison.txt")
+    return all_gen_results
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 
-def _parse():
-    p = argparse.ArgumentParser(description="Evaluate GazePredictor against real data")
-    p.add_argument(
-        "--checkpoint", required=True, help="Path to best_model.pt checkpoint"
-    )
-    p.add_argument(
+def _load_config(path: str) -> dict:
+    """
+    Load a JSON config file and return a flat dict of CLI arg overrides.
+
+    Keys should match CLI argument names, e.g.::
+
+        {
+            "dataset":       "mcfw-gaze",
+            "root":          "/data",
+            "out_dir":       "eval_results",
+            "checkpoint":    "/logs/runs/trial_0019/checkpoints/best_model.pt",
+            "n_generate":    100,
+            "gen_len":       256,
+            "vel_threshold": 30.0
+        }
+
+    Unlike the training scripts there is no ``model_config`` to extract —
+    model weights and architecture are read directly from the checkpoint.
+    CLI flags always override file values; the file only sets defaults.
+    """
+    return json.loads(Path(path).read_text())
+
+
+def _add_common_args(sp) -> None:
+    """Attach dataset / generation / event-detection flags to a subparser."""
+    sp.add_argument(
         "--dataset", required=True, help="pymovements dataset name, e.g. mcfw-gaze"
     )
-    p.add_argument("--root", required=True, help="Root directory for pymovements data")
-    p.add_argument(
-        "--out_dir", default="eval_results", help="Output directory for results"
+    sp.add_argument("--root", required=True, help="Root directory for pymovements data")
+    sp.add_argument(
+        "--out_dir",
+        default="eval_results",
+        help="Output root directory (generator sub-dir added automatically)",
     )
-
-    # Subset filter (mirrors DataloaderConfigBuilder)
-    p.add_argument("--subjects", nargs="*", default=None)
-    p.add_argument("--stimuli", nargs="*", default=None)
-    p.add_argument("--trial_ids", nargs="*", default=None)
-
+    # Subset
+    sp.add_argument("--subjects", nargs="*", default=None)
+    sp.add_argument("--stimuli", nargs="*", default=None)
+    sp.add_argument("--trial_ids", nargs="*", default=None)
     # Generation
-    p.add_argument(
-        "--n_generate",
-        type=int,
-        default=50,
-        help="Synthetic sequences to generate per stimulus",
+    sp.add_argument(
+        "--n_generate", type=int, default=50, help="Sequences to generate per stimulus"
     )
-    p.add_argument("--seed_len", type=int, default=10)
-    p.add_argument("--gen_len", type=int, default=128)
-    p.add_argument("--temperature", type=float, default=1.0)
-
+    sp.add_argument("--seed_len", type=int, default=10)
+    sp.add_argument("--gen_len", type=int, default=128)
     # Event detection
-    p.add_argument(
+    sp.add_argument(
         "--vel_threshold",
         type=float,
         default=30.0,
         help="IVT velocity threshold in deg/s",
     )
-    p.add_argument(
+    sp.add_argument(
+        "--dispersion_threshold",
+        type=float,
+        default=1.0,
+        help="IDT velocity threshold in deg/s",
+    )
+    sp.add_argument(
         "--min_fix_dur",
         type=int,
         default=10,
         help="Minimum fixation duration in samples",
     )
-    p.add_argument(
+    sp.add_argument(
         "--vel_method",
         default="fivepoint",
         choices=["fivepoint", "preceding", "smooth"],
-        help="Velocity computation method for pymovements",
     )
+    sp.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    return p.parse_args()
+
+def _build_parser() -> tuple:
+    """Build the argument parser. Returns ``(parser, subparsers_dict)``."""
+    p = argparse.ArgumentParser(
+        description="Evaluate gaze generators against real pymovements data",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Config file (--config):
+  Pass a JSON file with default values for any CLI argument so you don't
+  have to retype dataset paths, generation settings, or checkpoint locations.
+  CLI flags always override file values.
+
+  Useful keys:
+    dataset, root, out_dir, checkpoint, n_generate, gen_len, seed_len,
+    vel_threshold, min_fix_dur, vel_method, device, temperature, label
+
+  Example config (eval_config.json):
+    {
+        "dataset":    "mcfw-gaze",
+        "root":       "/data",
+        "checkpoint": "/logs/runs/trial_0019/checkpoints/best_model.pt",
+        "n_generate": 100,
+        "gen_len":    256
+    }
+
+  Usage:
+    python evaluate_model.py model --config eval_config.json
+    python evaluate_model.py model --config eval_config.json --n_generate 200
+    python evaluate_model.py compare --config eval_config.json --also_synthetic
+""",
+    )
+    p.add_argument(
+        "--config",
+        default=None,
+        metavar="PATH",
+        help="JSON config file.  Keys set CLI defaults; explicit flags override.",
+    )
+    sub = p.add_subparsers(dest="mode", required=True)
+
+    # ── model ──────────────────────────────────────────────────────────────
+    model_p = sub.add_parser("model", help="Evaluate a trained GMM checkpoint")
+    model_p.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Path to best_model.pt (required unless set via --config)",
+    )
+    model_p.add_argument("--temperature", type=float, default=1.0)
+    model_p.add_argument(
+        "--label", default=None, help="Override generator name in output paths"
+    )
+    _add_common_args(model_p)
+
+    # ── categorical ────────────────────────────────────────────────────────
+    cat_p = sub.add_parser(
+        "categorical", help="Evaluate a trained categorical checkpoint"
+    )
+    cat_p.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Path to best_model.pt (required unless set via --config)",
+    )
+    cat_p.add_argument("--temperature", type=float, default=1.0)
+    cat_p.add_argument("--label", default=None)
+    _add_common_args(cat_p)
+
+    # ── synthetic ──────────────────────────────────────────────────────────
+    syn_p = sub.add_parser(
+        "synthetic", help="Synthetic step-function baseline (no model needed)"
+    )
+    syn_p.add_argument("--noise", type=float, default=5)
+    syn_p.add_argument("--values_spread", type=float, default=0.7)
+    syn_p.add_argument("--fix_dur_mean", type=float, default=250.0)
+    syn_p.add_argument("--fix_dur_std", type=float, default=80.0)
+    syn_p.add_argument("--sac_dur_mean", type=float, default=40.0)
+    syn_p.add_argument("--sac_dur_std", type=float, default=15.0)
+    syn_p.add_argument("--seed", type=int, default=42)
+    syn_p.add_argument("--label", default=None)
+    _add_common_args(syn_p)
+
+    # ── compare ────────────────────────────────────────────────────────────
+    cmp_p = sub.add_parser(
+        "compare", help="Side-by-side comparison of multiple generators"
+    )
+    cmp_p.add_argument(
+        "--checkpoint", default=None, help="GMM checkpoint path (optional)"
+    )
+    cmp_p.add_argument(
+        "--cat_checkpoint", default=None, help="Categorical checkpoint path (optional)"
+    )
+    cmp_p.add_argument(
+        "--also_synthetic",
+        action="store_true",
+        help="Also include the synthetic step-function baseline",
+    )
+    cmp_p.add_argument("--temperature", type=float, default=1.0)
+    _add_common_args(cmp_p)
+
+    return p, {
+        "model": model_p,
+        "categorical": cat_p,
+        "synthetic": syn_p,
+        "compare": cmp_p,
+    }
+
+
+def _build_subset(args) -> Optional[Dict]:
+    subset: Dict = {}
+    if getattr(args, "subjects", None):
+        subset["subject_id"] = args.subjects
+    if getattr(args, "stimuli", None):
+        subset["stimulus_id"] = args.stimuli
+    if getattr(args, "trial_ids", None):
+        subset["trial_id"] = args.trial_ids
+    return subset or None
 
 
 def test():
+    """Quick smoke-test with the synthetic model generator."""
+    syn = SyntheticGenerator()
 
     run_evaluation(
-        checkpoint_path="/home/janhof/thesis/logs/runs/gaze_mamba_search/trial_0019/checkpoints/best_model.pt",
-        dataset_name="mcfw-gaze",
-        root="/home/janhof/thesis/data",
-        out_dir="/home/janhof/thesis/eval_results",
-        subset={"subject_id": ["001", "002"]},
+        generator=syn,
+        dataset_name="GGTG",
+        root=r"C:\Users\saphi\PycharmProjects\thesis\data",
+        out_dir=r"C:\Users\saphi\PycharmProjects\thesis\eval_results",
+        # subset={"subject_id": ["P01"]},
         n_generate=20,
         seed_len=32,
-        gen_len=200,
-        temperature=1,
-        vel_threshold=30,
-        min_fix_duration=10,
+        gen_len=2000,  # for each subject's recording of  stimulus, extracts normalized (x,y) gaze coordinates as sliding windows of length gen_len.
+        dispersion_threshold=1.0,
+        min_fix_duration=90,
         vel_method="fivepoint",
         device="cuda" if torch.cuda.is_available() else "cpu",
     )
+
+
+def main():
+    p, subparsers = _build_parser()
+
+    # ── Config file: scan sys.argv directly for --config ──────────────────
+    # We scan rather than use parse_known_args() to avoid conflicts with
+    # required-seeming args in subparsers (e.g. --checkpoint which is now
+    # optional at the parser level and validated manually below).
+    _argv = sys.argv[1:]
+    cfg: dict = {}
+    for i, arg in enumerate(_argv):
+        if arg == "--config" and i + 1 < len(_argv):
+            cfg_path = _argv[i + 1]
+            cfg = _load_config(cfg_path)
+            print(f"[config] loading {cfg_path}")
+            break
+
+    if cfg:
+        # Identify the subcommand so we only apply relevant defaults —
+        # e.g. don't set synthetic-only keys on the model subparser.
+        _modes = {"model", "categorical", "synthetic", "compare"}
+        mode_from_argv = next((a for a in _argv if a in _modes), None)
+        targets = (
+            [subparsers[mode_from_argv]]
+            if mode_from_argv in subparsers
+            else list(subparsers.values())
+        )
+        total_applied = 0
+        for sp in targets:
+            valid = {a.dest for a in sp._actions}
+            applied = {k: v for k, v in cfg.items() if k in valid}
+            if applied:
+                sp.set_defaults(**applied)
+                total_applied += len(applied)
+        print(f"[config] applied {total_applied} defaults from file")
+
+    args = p.parse_args()
+
+    # ── Manual validation for args that the config file may satisfy ───────
+    if args.mode in ("model", "categorical") and not args.checkpoint:
+        p.error(
+            f"{args.mode} mode requires --checkpoint (or set 'checkpoint' in --config)"
+        )
+
+    subset = _build_subset(args)
+
+    common = dict(
+        dataset_name=args.dataset,
+        root=args.root,
+        out_dir=args.out_dir,
+        subset=subset,
+        n_generate=args.n_generate,
+        seed_len=args.seed_len,
+        gen_len=args.gen_len,
+        vel_threshold=args.vel_threshold,
+        min_fix_duration=args.min_fix_dur,
+        vel_method=args.vel_method,
+        device=args.device,
+    )
+
+    if args.mode == "model":
+        gen = GMMModelGenerator(
+            args.checkpoint, args.temperature, args.device, args.label
+        )
+        run_evaluation(gen, **common)
+
+    elif args.mode == "categorical":
+        gen = CategoricalModelGenerator(
+            args.checkpoint, args.temperature, args.device, args.label
+        )
+        run_evaluation(gen, **common)
+
+    elif args.mode == "synthetic":
+        gen = SyntheticGenerator(
+            fix_dur_mean_ms=args.fix_dur_mean,
+            fix_dur_std_ms=args.fix_dur_std,
+            sac_dur_mean_ms=args.sac_dur_mean,
+            sac_dur_std_ms=args.sac_dur_std,
+            noise=args.noise,
+            values_spread=args.values_spread,
+            seed=args.seed,
+            label=args.label,
+        )
+        run_evaluation(gen, **common)
+
+    elif args.mode == "compare":
+        generators: List[SequenceGenerator] = []
+        if args.checkpoint:
+            generators.append(
+                GMMModelGenerator(args.checkpoint, args.temperature, args.device)
+            )
+        if args.cat_checkpoint:
+            generators.append(
+                CategoricalModelGenerator(
+                    args.cat_checkpoint, args.temperature, args.device
+                )
+            )
+        if args.also_synthetic:
+            generators.append(SyntheticGenerator())
+        if not generators:
+            raise ValueError(
+                "compare mode needs at least one of --checkpoint, "
+                "--cat_checkpoint, or --also_synthetic"
+            )
+        run_multi_evaluation(generators, **common)
 
 
 if __name__ == "__main__":

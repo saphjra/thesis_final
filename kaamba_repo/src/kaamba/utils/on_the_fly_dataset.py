@@ -402,6 +402,13 @@ def create_on_the_fly_loader(
         if dataset_name == "GGTG":
             print("subset loading by stimulus not supported, has to be passed as none")
             subset = {"subject_id": subset["subject_id"]}
+
+        # Guard: if the subset contains no subjects there is nothing to load
+        if subset is not None:
+            _subjects = subset.get("subject_id", None)
+            if isinstance(_subjects, list) and len(_subjects) == 0:
+                return None
+
         # Use pymovements dataset
         if dataset_type == "standard":
             dataset = PymovementsOnTheFlyGazeDataset(

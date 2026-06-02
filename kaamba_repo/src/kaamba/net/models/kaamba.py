@@ -22,7 +22,8 @@ from typing import Tuple
 
 import torch
 import torch.nn as nn
-from mamba_ssm import Mamba2
+
+# from mamba_ssm import Mamba2
 from transformers import ViTModel
 
 
