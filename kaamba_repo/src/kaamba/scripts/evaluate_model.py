@@ -358,13 +358,16 @@ _EMPTY_SAC = pl.DataFrame(
 )
 
 
-def _fix_df_from_events(ev_frame: pl.DataFrame, pos_arr: np.ndarray) -> pl.DataFrame:
+def _fix_df_from_events(
+    ev_frame: pl.DataFrame, pos_arr: np.ndarray, time_arr: np.ndarray
+) -> pl.DataFrame:
     """
     Filter fixation events from a preprocessed events DataFrame and append
     centroid columns ``cx_deg`` / ``cy_deg`` (mean deg position per fixation).
 
     ``pos_arr`` must be (T, 2) in degrees of visual angle — taken from
     ``gaze.samples["position"]`` after ``pix2deg()``.
+    ``time_arr`` must be (T,) with the same time unit as event onset/offset.
     """
     if ev_frame is None or len(ev_frame) == 0:
         return _EMPTY_FIX
@@ -373,7 +376,9 @@ def _fix_df_from_events(ev_frame: pl.DataFrame, pos_arr: np.ndarray) -> pl.DataF
         return _EMPTY_FIX
     cx_list, cy_list = [], []
     for row in fix.iter_rows(named=True):
-        seg = pos_arr[row["onset"] : row["offset"]]
+        i0 = int(np.searchsorted(time_arr, row["onset"]))
+        i1 = int(np.searchsorted(time_arr, row["offset"], side="right"))
+        seg = pos_arr[i0:i1]
         if len(seg) == 0:
             cx_list.append(float("nan"))
             cy_list.append(float("nan"))
@@ -391,7 +396,9 @@ def _fix_df_from_events(ev_frame: pl.DataFrame, pos_arr: np.ndarray) -> pl.DataF
     return result.select([c for c in keep if c in result.columns])
 
 
-def _sac_df_from_events(ev_frame: pl.DataFrame, pos_arr: np.ndarray) -> pl.DataFrame:
+def _sac_df_from_events(
+    ev_frame: pl.DataFrame, pos_arr: np.ndarray, time_arr: np.ndarray
+) -> pl.DataFrame:
     """
     Filter saccade events, append saccade direction ``angle_rad``, and rename
     ``amplitude`` → ``amplitude_deg``  /  ``peak_velocity`` → ``peak_vel_deg_s``
@@ -399,6 +406,7 @@ def _sac_df_from_events(ev_frame: pl.DataFrame, pos_arr: np.ndarray) -> pl.DataF
 
     ``amplitude`` and ``peak_velocity`` must already be present — they are
     added by ``compute_event_properties(["amplitude", "peak_velocity", ...])``.
+    ``time_arr`` must be (T,) with the same time unit as event onset/offset.
     """
     if ev_frame is None or len(ev_frame) == 0:
         return _EMPTY_SAC
@@ -407,7 +415,9 @@ def _sac_df_from_events(ev_frame: pl.DataFrame, pos_arr: np.ndarray) -> pl.DataF
         return _EMPTY_SAC
     angle_list = []
     for row in sac.iter_rows(named=True):
-        seg = pos_arr[row["onset"] : row["offset"]]
+        i0 = int(np.searchsorted(time_arr, row["onset"]))
+        i1 = int(np.searchsorted(time_arr, row["offset"], side="right"))
+        seg = pos_arr[i0:i1]
         if len(seg) > 1:
             angle_list.append(
                 float(np.arctan2(seg[-1, 1] - seg[0, 1], seg[-1, 0] - seg[0, 0]))
@@ -664,6 +674,7 @@ def run_evaluation(
     gen_len: int = 128,
     vel_threshold: float = 30.0,  # deg/s IVT threshold
     min_fix_duration: int = 100,  # samples
+    min_sac_duration: int = 30,
     dispersion_threshold: float = 1.0,  # deg, for I-DT fixation detection
     vel_method: str = "fivepoint",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
@@ -780,11 +791,12 @@ def run_evaluation(
                 # dataset-level preprocessing above — no clone, no copy.
                 px_raw = np.stack(gaze.samples["pixel"].to_numpy())  # (T,2) px
                 pos_arr = np.stack(gaze.samples["position"].to_numpy())  # (T,2) deg
+                time_arr = gaze.samples["time"].to_numpy()  # (T,) timestamps
                 norm_arr = np.column_stack(
                     [px_raw[:, 0] / scr_w_px, px_raw[:, 1] / scr_h_px]
                 )
-                fix_df = _fix_df_from_events(ev_frame.frame, pos_arr)
-                sac_df = _sac_df_from_events(ev_frame.frame, pos_arr)
+                fix_df = _fix_df_from_events(ev_frame.frame, pos_arr, time_arr)
+                sac_df = _sac_df_from_events(ev_frame.frame, pos_arr, time_arr)
             except Exception as e:
                 print(
                     f"  [warn] {stim_name} / {gaze.metadata.get('subject_id')} "
@@ -854,15 +866,21 @@ def run_evaluation(
             try:
                 g_fake.pix2deg()
                 g_fake.pos2vel(method=vel_method)
-                g_fake.detect("idt", clear=True, minimum_duration=100)
-                g_fake.detect("microsaccades", minimum_duration=3)
+                g_fake.detect(
+                    "idt",
+                    clear=True,
+                    minimum_duration=min_fix_duration,
+                    dispersion_threshold=dispersion_threshold,
+                )
+                g_fake.detect("microsaccades", minimum_duration=min_sac_duration)
                 g_fake.compute_event_properties(
                     ["amplitude", "dispersion", "peak_velocity"]
                 )
                 pos_f = np.stack(g_fake.samples["position"].to_numpy())
+                time_f = g_fake.samples["time"].to_numpy()
                 ev_df = g_fake.events.frame
-                all_fake_fix.append(_fix_df_from_events(ev_df, pos_f))
-                all_fake_sac.append(_sac_df_from_events(ev_df, pos_f))
+                all_fake_fix.append(_fix_df_from_events(ev_df, pos_f, time_f))
+                all_fake_sac.append(_sac_df_from_events(ev_df, pos_f, time_f))
             except Exception as e:
                 tqdm.write(f"  [warn] fake event detection failed: {e}")
 
@@ -1559,7 +1577,13 @@ def _add_common_args(sp) -> None:
     sp.add_argument(
         "--min_fix_dur",
         type=int,
-        default=10,
+        default=90,  # divide by 120 for mfcw
+        help="Minimum fixation duration in samples",
+    )
+    sp.add_argument(
+        "--min_sac_dur",
+        type=int,
+        default=30,  # divide by 120 for mfcw
         help="Minimum fixation duration in samples",
     )
     sp.add_argument(
@@ -1700,6 +1724,7 @@ def test():
         gen_len=2000,  # for each subject's recording of  stimulus, extracts normalized (x,y) gaze coordinates as sliding windows of length gen_len.
         dispersion_threshold=1.0,
         min_fix_duration=90,
+        min_sac_duration=30,
         vel_method="fivepoint",
         device="cuda" if torch.cuda.is_available() else "cpu",
     )
@@ -1760,6 +1785,7 @@ def main():
         gen_len=args.gen_len,
         vel_threshold=args.vel_threshold,
         min_fix_duration=args.min_fix_dur,
+        min_sac_duration=args.min_sac_dur,
         vel_method=args.vel_method,
         device=args.device,
     )

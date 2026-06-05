@@ -2,7 +2,7 @@
 dataset_stats.py
 
 Descriptive statistics and visualisations for the gaze datasets used in
-training. Event detection uses the exact same IVT + fill pipeline as
+training. Event detection uses the exact same IDT + fill pipeline as
 evaluate_model.py, so all numbers are directly comparable to evaluation
 results and can be cited side-by-side in a thesis.
 
@@ -120,20 +120,25 @@ _EMPTY_SAC = pl.DataFrame(
 )
 
 
-def _fix_df_from_events(ev_frame: pl.DataFrame, pos_arr: np.ndarray) -> pl.DataFrame:
+def _fix_df_from_events(
+    ev_frame: pl.DataFrame, pos_arr: np.ndarray, time_arr: np.ndarray
+) -> pl.DataFrame:
     """
-    Filter fixation.ivt events and append centroid columns cx_deg / cy_deg
+    Filter fixation events and append centroid columns cx_deg / cy_deg
     (mean position in degrees of visual angle per fixation).
     pos_arr: (T, 2) from gaze.samples["position"] after pix2deg().
+    time_arr: (T,) time values matching the rows of pos_arr (same unit as onset/offset).
     """
     if ev_frame is None or len(ev_frame) == 0:
         return _EMPTY_FIX
-    fix = ev_frame.filter(pl.col("name") == "fixation.ivt")
+    fix = ev_frame.filter(pl.col("name") == "fixation")
     if len(fix) == 0:
         return _EMPTY_FIX
     cx_list, cy_list = [], []
     for row in fix.iter_rows(named=True):
-        seg = pos_arr[row["onset"] : row["offset"]]
+        i0 = int(np.searchsorted(time_arr, row["onset"]))
+        i1 = int(np.searchsorted(time_arr, row["offset"], side="right"))
+        seg = pos_arr[i0:i1]
         if len(seg) == 0:
             cx_list.append(float("nan"))
             cy_list.append(float("nan"))
@@ -150,7 +155,9 @@ def _fix_df_from_events(ev_frame: pl.DataFrame, pos_arr: np.ndarray) -> pl.DataF
     return result.select([c for c in keep if c in result.columns])
 
 
-def _sac_df_from_events(ev_frame: pl.DataFrame, pos_arr: np.ndarray) -> pl.DataFrame:
+def _sac_df_from_events(
+    ev_frame: pl.DataFrame, pos_arr: np.ndarray, time_arr: np.ndarray
+) -> pl.DataFrame:
     """
     Filter saccade events, append angle_rad (direction), and rename
     amplitude → amplitude_deg  /  peak_velocity → peak_vel_deg_s.
@@ -163,7 +170,9 @@ def _sac_df_from_events(ev_frame: pl.DataFrame, pos_arr: np.ndarray) -> pl.DataF
         return _EMPTY_SAC
     angle_list = []
     for row in sac.iter_rows(named=True):
-        seg = pos_arr[row["onset"] : row["offset"]]
+        i0 = int(np.searchsorted(time_arr, row["onset"]))
+        i1 = int(np.searchsorted(time_arr, row["offset"], side="right"))
+        seg = pos_arr[i0:i1]
         if len(seg) > 1:
             angle_list.append(
                 float(np.arctan2(seg[-1, 1] - seg[0, 1], seg[-1, 0] - seg[0, 0]))
@@ -245,7 +254,8 @@ def compute_dataset_statistics(
     stride: int = 1,
     vel_threshold: float = 30.0,
     dispersion_threshold: float = 1,
-    min_fix_dur: int = 10,
+    min_fix_dur: int = 100,
+    min_sac_dur: int = 30,
     subset: Optional[dict] = None,
 ) -> Dict:
     """
@@ -291,10 +301,30 @@ def compute_dataset_statistics(
     )
     print(f"  Recordings: {len(dataset.gaze)}")
 
+    # ── Normalise time column to uniform integer milliseconds ─────────────
+    # Some datasets (e.g. mcfw-gaze) store timestamps in seconds with
+    # fractional parts.  IDT requires a perfectly uniform integer sequence:
+    # multiply by 1000 to get ms, then reconstruct a synthetic uniform grid
+    # from t0 + i * interval so diffs are exactly constant.
+    # Also snap min_fix_dur to the nearest multiple of the interval so the
+    # IDT divisibility check passes.
+    interval_ms = int(round(1000 / sr))  # e.g. 8 for 120 Hz
+    min_fix_dur = max(interval_ms, (min_fix_dur // interval_ms) * interval_ms)
+    min_sac_dur = max(interval_ms, (min_sac_dur // interval_ms) * interval_ms)
+    for gaze in dataset.gaze:
+        if "time" in gaze.frame.columns:
+            t0 = int(round(float(gaze.frame["time"][0]) * 1000))
+            n = len(gaze.frame)
+            gaze.frame = gaze.frame.with_columns(
+                pl.Series(
+                    "time", [t0 + i * interval_ms for i in range(n)], dtype=pl.Int64
+                )
+            )
+
     # ── Preprocess entire dataset with pymovements built-ins ──────────────
     # Runs once on the stored polars frames — no cloning, no manual velocity.
     print(
-        "  Preprocessing: pix2deg → pos2vel → IVT → microsaccades → event properties …"
+        "  Preprocessing: pix2deg → pos2vel → IDT → microsaccades → event properties …"
     )
     dataset.pix2deg()
     dataset.pos2vel(method="fivepoint")
@@ -302,10 +332,9 @@ def compute_dataset_statistics(
         "idt",
         minimum_duration=min_fix_dur,
         dispersion_threshold=dispersion_threshold,
-        name="fixation",
     )
-    dataset.detect_events(method="fill")
-    # dataset.detect_events("microsaccades", minimum_duration=1)
+
+    dataset.detect_events("microsaccades", minimum_duration=min_sac_dur)
     dataset.compute_event_properties(["amplitude", "dispersion", "peak_velocity"])
     print("  Preprocessing complete")
 
@@ -336,6 +365,7 @@ def compute_dataset_statistics(
         try:
             px_raw = np.stack(gaze.samples["pixel"].to_numpy())  # (T,2) px
             pos_arr = np.stack(gaze.samples["position"].to_numpy())  # (T,2) deg
+            time_arr = gaze.samples["time"].to_numpy()  # (T,) timestamps
             norm_arr = np.column_stack(
                 [px_raw[:, 0] / scr_w_px, px_raw[:, 1] / scr_h_px]
             )
@@ -350,8 +380,8 @@ def compute_dataset_statistics(
         recording_lengths.append(T)
         recording_durations_s.append(T / sr)
 
-        fix_df = _fix_df_from_events(ev_frame.frame, pos_arr)
-        sac_df = _sac_df_from_events(ev_frame.frame, pos_arr)
+        fix_df = _fix_df_from_events(ev_frame.frame, pos_arr, time_arr)
+        sac_df = _sac_df_from_events(ev_frame.frame, pos_arr, time_arr)
         all_fix_df.append(fix_df)
         all_sac_df.append(sac_df)
         all_norm_pts.append(norm_arr)
@@ -759,7 +789,7 @@ def _plot_saccade_amplitude(sac_amp: np.ndarray, out_path: Path):
         color="#CCCCCC",
         alpha=0.3,
         zorder=0,
-        label="Physiological range",
+        label="plausible range",
     )
     ax.set_xlabel("Saccade amplitude (°)")
     ax.set_ylabel("Density")
@@ -1144,6 +1174,7 @@ def run_dataset_stats(
     stride: int = 1,
     vel_threshold: float = 30.0,
     min_fix_dur: int = 10,
+    min_sac_dur: int = 10,
     dispersion_threshold: float = 1.0,
     subset: Optional[dict] = None,
 ) -> Dict[str, Dict]:
@@ -1162,6 +1193,7 @@ def run_dataset_stats(
             stride=stride,
             vel_threshold=vel_threshold,
             dispersion_threshold=dispersion_threshold,
+            min_sac_dur=min_sac_dur,
             min_fix_dur=min_fix_dur,
             subset=subset,
         )
@@ -1220,14 +1252,20 @@ def _parse():
     p.add_argument(
         "--dispersion_threshold",
         type=float,
-        default=1,
+        default=1.0,
         help="IDT dispresion threshold in deg/visual angle",
     )
     p.add_argument(
         "--min_fix_dur",
         type=int,
-        default=90,
+        default=100,
         help="Minimum fixation duration in samples",
+    )
+    p.add_argument(
+        "--min_sac_dur",
+        type=int,
+        default=10,
+        help="Minimum saccade duration in samples",
     )
     p.add_argument(
         "--subjects", nargs="*", default=None, help="Limit to specific subject IDs"
@@ -1247,6 +1285,7 @@ def main():
         vel_threshold=args.vel_threshold,
         dispersion_threshold=args.dispersion_threshold,
         min_fix_dur=args.min_fix_dur,
+        min_sac_dur=args.min_sac_dur,
         subset=subset,
     )
 
