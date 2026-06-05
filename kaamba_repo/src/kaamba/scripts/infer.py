@@ -81,19 +81,10 @@ def _load_model(
     """
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model_config: dict = ckpt.get("config", {}).get("model_config", {})
+    from kaamba.net.models.kaamba import build_gaze_predictor
 
-    if "n_bins" in model_config:
-        from kaamba.net.models.kaamba_categorical import (
-            build_categorical_gaze_predictor,
-        )
-
-        model = build_categorical_gaze_predictor(**model_config)
-        model_type = "categorical"
-    else:
-        from kaamba.net.models.kaamba import build_gaze_predictor
-
-        model = build_gaze_predictor(**model_config)
-        model_type = "gmm"
+    model = build_gaze_predictor(**model_config)
+    model_type = "gmm"
 
     model.load_state_dict(ckpt["model_state_dict"])
     model = model.to(device).eval()
@@ -175,41 +166,6 @@ def _generate_gmm(
     return seq.permute(0, 2, 1).cpu().numpy().astype(np.float32)  # (N, T, 2)
 
 
-def _generate_categorical(
-    model,
-    img_tensor: torch.Tensor,
-    n: int,
-    gen_len: int,
-    seed_len: int,
-    temperature: float,
-    start_xy: Tuple[float, float],
-    n_bins: int,
-    device: str,
-) -> np.ndarray:
-    """
-    Autoregressively sample from a categorical model.
-    Returns (n, gen_len, 2) float32 in normalised [0, 1].
-    """
-    sx, sy = start_xy
-    images = img_tensor.expand(n, -1, -1, -1)
-    seq = torch.zeros(n, 2, seed_len, device=device)
-    seq[:, 0, :] = sx
-    seq[:, 1, :] = sy
-
-    with torch.no_grad():
-        for _ in range(gen_len - seed_len):
-            lx, ly = model(images, seq)  # each (N, n_bins, T)
-            px = (lx[:, :, -1] / temperature).softmax(1)  # (N, n_bins)
-            py = (ly[:, :, -1] / temperature).softmax(1)
-            xb = torch.multinomial(px, 1).squeeze(1).float()
-            yb = torch.multinomial(py, 1).squeeze(1).float()
-            xc = (xb + 0.5) / n_bins
-            yc = (yb + 0.5) / n_bins
-            seq = torch.cat([seq, torch.stack([xc, yc], 1).unsqueeze(2)], dim=2)
-
-    return seq.permute(0, 2, 1).cpu().numpy().astype(np.float32)  # (N, T, 2)
-
-
 def generate(
     checkpoint_path: str,
     image_path: str | Path,
@@ -256,11 +212,6 @@ def generate(
     if model_type == "gmm":
         seqs = _generate_gmm(
             model, img_t, n, gen_len, seed_len, temperature, start_xy, device
-        )
-    else:
-        n_bins = model_config.get("n_bins", 64)
-        seqs = _generate_categorical(
-            model, img_t, n, gen_len, seed_len, temperature, start_xy, n_bins, device
         )
 
     run_name = Path(checkpoint_path).parent.parent.name
@@ -376,6 +327,7 @@ def _draw_overlay(
 
     # ── Colour scheme ─────────────────────────────────────────────────────
     use_time_colour = n_show == 1
+
     if use_time_colour:
         cmap = plt.get_cmap("plasma")
         palette = None
@@ -908,19 +860,6 @@ def main():
             args.seed_len,
             args.temperature,
             start_xy,
-            args.device,
-        )
-    else:
-        n_bins = model_config.get("n_bins", 64)
-        seqs = _generate_categorical(
-            model,
-            img_t,
-            args.n,
-            args.gen_len,
-            args.seed_len,
-            args.temperature,
-            start_xy,
-            n_bins,
             args.device,
         )
 

@@ -53,7 +53,9 @@ from kaamba.utils.dataloader_config_builder import (
 from kaamba.utils.loss_functions import gmm_nll
 from kaamba.utils.memory_monitor import MemoryMonitor, memory_tracker
 
+import os
 
+os.environ["NCCL_TIMEOUT"] = "60"
 # ---------------------------------------------------------------------------
 # Encoder presets
 # ---------------------------------------------------------------------------
@@ -96,7 +98,7 @@ class ExperimentConfig:
     train_ratio: float = 0.70
     val_ratio: float = 0.15
     test_ratio: float = 0.15
-    context_len: int = 32
+    context_len: int = 3200
     stride: int = 1
     sampling_step: int = 1
     max_image_size: int = 224
@@ -207,7 +209,10 @@ class ExperimentTracker:
                 if self.trial.should_prune():
                     should_prune[0] = 1.0
 
-            if self.accelerator.num_processes > 1:
+            if (
+                self.accelerator.num_processes > 1
+                and torch.distributed.is_initialized()
+            ):
                 torch.distributed.broadcast(should_prune, src=0)
 
             if should_prune.item() == 1.0:
@@ -396,26 +401,26 @@ def train_on_the_fly(
     # Data
     dataset_name: str | List[str],
     root: str,
-    split_strategy: str = "participant",
-    train_ratio: float = 0.80,
-    val_ratio: float = 0.2,
-    test_ratio: float = 0.0,
+    split_strategy: str,
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+    # Loader
+    batch_size: int,
+    num_workers: int,
+    context_len: int,
+    stride: int,
+    sampling_step: int,
+    max_image_size: int,
+    # Training
+    num_epochs: int,
+    lr: float,
+    weight_decay: float,
+    grad_clip: float,
+    patience: int,
     exclude_participants: Optional[List] = None,
     exclude_stimuli: Optional[List] = None,
     exclude_trials: Optional[List] = None,
-    # Loader
-    batch_size: int = 256,
-    num_workers: int = 1,
-    context_len: int = 32,
-    stride: int = 1,
-    sampling_step: int = 1,
-    max_image_size: int = 224,
-    # Training
-    num_epochs: int = 100,
-    lr: float = 1e-4,
-    weight_decay: float = 1e-5,
-    grad_clip: float = 1.0,
-    patience: int = 5,
     # Tracking
     log_dir: str = "logs/runs",
     run_name: Optional[str] = None,
@@ -504,6 +509,7 @@ def train_on_the_fly(
         tracker.save_loader_configs(loader_configs)
         # ── Model ─────────────────────────────────────────────────────────
         model = build_gaze_predictor(**model_config)
+
         optimizer = torch.optim.AdamW(
             filter(lambda p: p.requires_grad, model.parameters()),
             lr=lr,
@@ -523,7 +529,8 @@ def train_on_the_fly(
             return accelerator.prepare(loader)
 
         train_loader = _prepare_loader(train_loader, accelerator)
-        val_loader = _prepare_loader(val_loader, accelerator)
+        if not val_loader == 0.0:
+            val_loader = _prepare_loader(val_loader, accelerator)
         if not test_ratio == 0.0:
             test_loader = _prepare_loader(test_loader, accelerator)
 
@@ -553,22 +560,27 @@ def train_on_the_fly(
                 images = batch["image"].to(accelerator.device)
                 inputs = batch["input_seq"].to(accelerator.device)
                 targets = batch["target_seq"].to(accelerator.device).permute(0, 2, 1)
+                try:
+                    optimizer.zero_grad()
+                    pi, mu, log_sx, log_sy, rho_raw = model(images, inputs)
+                    loss = gmm_nll(pi, mu, log_sx, log_sy, rho_raw, targets)
 
-                optimizer.zero_grad()
-                pi, mu, log_sx, log_sy, rho_raw = model(images, inputs)
-                loss = gmm_nll(pi, mu, log_sx, log_sy, rho_raw, targets)
+                    if batch_idx == 0 and accelerator.is_main_process:
+                        accelerator.print(
+                            f"  [dbg] mu {mu.min():.3f}/{mu.mean():.3f}/{mu.max():.3f}"
+                            f"  log_sx {log_sx.mean():.3f}  rho {rho_raw.max():.3f}"
+                            f"  target {targets.min():.3f}/{targets.max():.3f}"
+                            f"  loss {loss.item():.4f}"
+                        )
 
-                if batch_idx == 0 and accelerator.is_main_process:
-                    accelerator.print(
-                        f"  [dbg] mu {mu.min():.3f}/{mu.mean():.3f}/{mu.max():.3f}"
-                        f"  log_sx {log_sx.mean():.3f}  rho {rho_raw.max():.3f}"
-                        f"  target {targets.min():.3f}/{targets.max():.3f}"
-                        f"  loss {loss.item():.4f}"
-                    )
-
-                accelerator.backward(loss)
-                accelerator.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-                optimizer.step()
+                    accelerator.backward(loss)
+                    accelerator.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                    optimizer.step()
+                except torch.cuda.OutOfMemoryError:
+                    # Synchronize both ranks before raising — prevents NCCL desync
+                    if torch.distributed.is_initialized():
+                        torch.distributed.barrier()
+                    raise
 
                 total_loss += loss.item()
                 nb += 1
@@ -687,17 +699,18 @@ def run_hparam_search(
     # Fixed data config (not searched)
     dataset_name: str | List[str],
     root: str,
-    split_strategy: str = "participant",
-    train_ratio: float = 0.70,
-    val_ratio: float = 0.15,
-    test_ratio: float = 0.15,
+    split_strategy: str,
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+    context_len: int,
+    sampling_step: int,
+    max_image_size: int,
+    num_workers: int,
+    stride: int,
     exclude_participants: Optional[List] = None,
     exclude_stimuli: Optional[List] = None,
     exclude_trials: Optional[List] = None,
-    context_len: int = 128,
-    sampling_step: int = 1,
-    max_image_size: int = 224,
-    num_workers: int = 1,
     # Search budget
     n_trials: int = 50,
     n_epochs_per_trial: int = 10,
@@ -708,8 +721,11 @@ def run_hparam_search(
     storage: Optional[str] = None,  # e.g. "sqlite:///study.db"
     use_wandb: bool = False,
 ):
+    accelerator = Accelerator()
     study_dir = Path(log_dir) / study_name
-    study_dir.mkdir(parents=True, exist_ok=True)
+    if accelerator.is_main_process:
+        study_dir.mkdir(parents=True, exist_ok=True)
+    # accelerator.wait_for_everyone()
 
     if storage is None:
         storage = f"sqlite:///{study_dir}/study.db"
@@ -732,7 +748,7 @@ def run_hparam_search(
             "encoder_type": trial.suggest_categorical(
                 "encoder_type", ["vit", "resnet", "siglip"]
             ),
-            "d_model": trial.suggest_categorical("d_model", [128, 256, 512, 1024]),
+            "d_model": trial.suggest_categorical("d_model", [128, 256, 512]),
             "n_layers": trial.suggest_int("n_layers", 4, 12),
             "n_mix": trial.suggest_int("n_mix", 3, 8),
             "image_embed_dim": trial.suggest_categorical("image_embed_dim", [256, 512]),
@@ -750,10 +766,8 @@ def run_hparam_search(
         lr = trial.suggest_float("lr", 1e-6, 1e-3, log=True)
         weight_decay = trial.suggest_float("weight_decay", 1e-7, 1e-3, log=True)
         grad_clip = trial.suggest_float("grad_clip", 0.1, 2.0)
-        batch_size = trial.suggest_categorical("batch_size", [256])
-        stride = 32  # trial.suggest_int("stride", 1, 32)
+        batch_size = trial.suggest_categorical("batch_size", [256, 512])
 
-        accelerator = Accelerator()
         try:
             _, best_val = train_on_the_fly(
                 model_config=model_config,
@@ -786,11 +800,13 @@ def run_hparam_search(
             )
             return best_val
         except torch.cuda.OutOfMemoryError:
+            gc.collect()
+            torch.cuda.empty_cache()
             raise optuna.TrialPruned("OOM")
+
         finally:
             gc.collect()
             torch.cuda.empty_cache()
-            accelerator.end_training()
 
     study.optimize(
         objective,
@@ -888,19 +904,19 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Kaamba gaze predictor — training & hyperparameter search",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Config file (--config):
-  Pass any of the JSON files produced by this script to reproduce or continue
-  a run without retyping every argument.  CLI flags always win over the file.
+        Config file (--config):
+          Pass any of the JSON files produced by this script to reproduce or continue
+          a run without retyping every argument.  CLI flags always win over the file.
 
-  config.json       saved per run by ExperimentConfig  (recommended)
-  best_trial.json   Optuna best-trial summary
-  plain JSON        hand-written file with CLI-style keys
+          config.json       saved per run by ExperimentConfig  (recommended)
+          best_trial.json   Optuna best-trial summary
+          plain JSON        hand-written file with CLI-style keys
 
-  Examples:
-    python train.py --config logs/runs/trial_0019/config.json
-    python train.py --config logs/study/best_trial.json --num_epochs 200
-    python train.py --config my_config.json --datasets mcfw-gaze GGTG
-""",
+          Examples:
+            python train.py --config logs/runs/trial_0019/config.json
+            python train.py --config logs/study/best_trial.json --num_epochs 200
+            python train.py --config my_config.json --datasets mcfw-gaze GGTG
+        """,
     )
     p.add_argument(
         "--config",
@@ -914,10 +930,17 @@ Config file (--config):
     p.add_argument("--datasets", nargs="+", default=["mcfw-gaze"])
     p.add_argument("--root", default="/home/janhof/thesis/data/")
     p.add_argument("--log_dir", default="/home/janhof/thesis/logs/runs")
-    p.add_argument("--context_len", type=int, default=32)
+    p.add_argument("--context_len", type=int, default=200)
     p.add_argument("--sampling_step", type=int, default=1)
     p.add_argument("--max_image_size", type=int, default=224)
-    p.add_argument("--num_workers", type=int, default=1)
+    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument(
+        "--stride",
+        type=int,
+        choices=[1, 8],
+        default=1,
+        help="1 for mcfw gaze 8 for GGTG",
+    )
     p.add_argument(
         "--exclude_participants",
         nargs="*",
@@ -936,10 +959,16 @@ Config file (--config):
         default=None,
         help="Trial IDs to exclude.",
     )
+    p.add_argument(
+        "--split_strategy",
+        type=str,
+        choices=["participant", "stimulus", "random"],
+        default="stimulus",
+    )
 
     # ── train-only ────────────────────────────────────────────────────────
     p.add_argument("--num_epochs", type=int, default=100)
-    p.add_argument("--batch_size", type=int, default=1024)
+    p.add_argument("--batch_size", type=int, default=512)
     p.add_argument("--lr", type=float, default=0.00014293225713757568)
     p.add_argument("--weight_decay", type=float, default=1.49611258828362e-06)
     p.add_argument("--grad_clip", type=float, default=0.8121195670502164)
@@ -949,9 +978,11 @@ Config file (--config):
 
     # ── search-only ───────────────────────────────────────────────────────
     p.add_argument("--n_trials", type=int, default=50)
-    p.add_argument("--n_epochs_per_trial", type=int, default=10)
-    p.add_argument("--max_batches_per_epoch", type=int, default=128)
-    p.add_argument("--study_name", default="gaze_mamba_search_only_mfcw")
+    p.add_argument("--n_epochs_per_trial", type=int, default=8)
+    p.add_argument("--max_batches_per_epoch", type=int, default=512)
+    p.add_argument(
+        "--study_name", default="gaze_mamba_search_only_mfcw_gaze_context_200_siglip"
+    )
     p.add_argument("--storage", default=None)
 
     return p
@@ -960,7 +991,7 @@ Config file (--config):
 # Hardcoded fallback exclude lists (used when --exclude_* is not set via CLI
 # or config file).
 _DEFAULT_EXCLUDE_PARTICIPANTS_TRAIN = ["P01", "P02"]
-_DEFAULT_EXCLUDE_STIMULI_TRAIN = ["22", "23"]
+_DEFAULT_EXCLUDE_STIMULI_TRAIN = []
 _DEFAULT_EXCLUDE_TRIALS_TRAIN = ["", "4", "5"]
 _DEFAULT_EXCLUDE_PARTICIPANTS_SEARCH = [
     "P01",
@@ -973,12 +1004,19 @@ _DEFAULT_EXCLUDE_PARTICIPANTS_SEARCH = [
     "P08",
     "001",
     "002",
+    "015",
+    "014",
+    "013",
+    "012",
 ]
 _DEFAULT_EXCLUDE_STIMULI_SEARCH = ["22", "23"]
-_DEFAULT_EXCLUDE_TRIALS_SEARCH = ["", "2", "4", "5"]
+_DEFAULT_EXCLUDE_TRIALS_SEARCH = ["", "3", "2", "4", "5"]
 
 
 def main():
+    import os
+
+    print(os.environ["CUDA_VISIBLE_DEVICES"])
     p = _build_parser()
 
     # ── Two-pass parse: peek at --config → set file defaults → full parse ─
@@ -1019,7 +1057,7 @@ def main():
             model_config=model_config,
             dataset_name=args.datasets,
             root=args.root,
-            split_strategy="participant",
+            split_strategy="stimuli",
             context_len=args.context_len,
             sampling_step=args.sampling_step,
             max_image_size=args.max_image_size,
@@ -1082,6 +1120,11 @@ def main():
                 if args.exclude_trials is not None
                 else _DEFAULT_EXCLUDE_TRIALS_SEARCH
             ),
+            split_strategy=args.split_strategy,
+            train_ratio=0.70,
+            val_ratio=0.15,
+            test_ratio=0.15,
+            stride=args.stride,
         )
 
 

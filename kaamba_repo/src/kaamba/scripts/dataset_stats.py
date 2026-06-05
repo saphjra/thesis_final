@@ -73,7 +73,86 @@ PHYSIO_FIX_MIN_MS = 20.0  # minimum plausible fixation duration
 PHYSIO_FIX_MAX_MS = 800.0  # maximum plausible fixation duration
 PHYSIO_SAC_MIN_DEG = 30
 PHYSIO_SAC_MAX_DEG = 500.0
-
+MCFW_STIMULUS = [
+    "20",
+    "21",
+    "24",
+    "25",
+    "26",
+    "27",
+    "28",
+    "29",
+    "30",
+    "31",
+    "32",
+    "33",
+    "34",
+    "35",
+    "36",
+    "37",
+    "38",
+    "39",
+    "40",
+    "41",
+    "42",
+    "43",
+    "44",
+    "45",
+    "46",
+    "47",
+    "48",
+    "49",
+    "50",
+    "51",
+    "52",
+    "53",
+    "54",
+    "55",
+    "56",
+    "57",
+    "58",
+    "59",
+    "60",
+    "61",
+    "62",
+    "63",
+    "64",
+    "65",
+    "66",
+    "67",
+    "68",
+    "69",
+    "70",
+    "71",
+    "72",
+    "73",
+    "74",
+    "75",
+    "76",
+    "77",
+    "78",
+    "79",
+    "80",
+    "81",
+    "82",
+    "83",
+    "84",
+    "85",
+    "86",
+    "87",
+    "88",
+    "89",
+    "90",
+    "91",
+    "92",
+    "93",
+    "94",
+    "95",
+    "96",
+    "97",
+    "98",
+    "99",
+]
 
 plt.rcParams.update(
     {
@@ -269,6 +348,12 @@ def compute_dataset_statistics(
     dataset_paths = pm.DatasetPaths(root=root)
     dataset = pm.Dataset(dataset_name, path=dataset_paths)
     dataset.scan()
+    if dataset_name == "mcfw-gaze":  # only include data concerning images
+        default_subset = {"trial_id": ["1", "2", "3"], "stimulus": MCFW_STIMULUS}
+        if subset is not None:
+            default_subset.update(subset)
+        subset = default_subset
+    print(subset)
     dataset.load(subset=subset)
     if dataset_name == "GGTG":
         dataset.split_gaze_data("stimulus")
@@ -301,31 +386,36 @@ def compute_dataset_statistics(
     )
     print(f"  Recordings: {len(dataset.gaze)}")
 
-    # ── Normalise time column to uniform integer milliseconds ─────────────
-    # Some datasets (e.g. mcfw-gaze) store timestamps in seconds with
-    # fractional parts.  IDT requires a perfectly uniform integer sequence:
-    # multiply by 1000 to get ms, then reconstruct a synthetic uniform grid
-    # from t0 + i * interval so diffs are exactly constant.
-    # Also snap min_fix_dur to the nearest multiple of the interval so the
-    # IDT divisibility check passes.
-    interval_ms = int(round(1000 / sr))  # e.g. 8 for 120 Hz
-    min_fix_dur = max(interval_ms, (min_fix_dur // interval_ms) * interval_ms)
-    min_sac_dur = max(interval_ms, (min_sac_dur // interval_ms) * interval_ms)
-    for gaze in dataset.gaze:
-        if "time" in gaze.frame.columns:
-            t0 = int(round(float(gaze.frame["time"][0]) * 1000))
-            n = len(gaze.frame)
-            gaze.frame = gaze.frame.with_columns(
-                pl.Series(
-                    "time", [t0 + i * interval_ms for i in range(n)], dtype=pl.Int64
-                )
-            )
-
     # ── Preprocess entire dataset with pymovements built-ins ──────────────
     # Runs once on the stored polars frames — no cloning, no manual velocity.
     print(
         "  Preprocessing: pix2deg → pos2vel → IDT → microsaccades → event properties …"
     )
+    if dataset_name == "mcfw-gaze":
+        # dataset is in seconds instead of milliseconds and then with non constants intervals which is expected by idt
+        # additionally the normalization of the screen coordinates is reversed to make comparable
+
+        interval_ms = int(round(1000 / sr))  # e.g. 8 for 120 Hz
+        min_fix_dur = max(interval_ms, (min_fix_dur // interval_ms) * interval_ms)
+        min_sac_dur = max(interval_ms, (min_sac_dur // interval_ms) * interval_ms)
+
+        for gaze in dataset.gaze:
+            if "time" in gaze.samples.columns:
+                t0 = int(round(float(gaze.samples["time"][0]) * 1000))
+                n = len(gaze.samples)
+                gaze.samples = gaze.samples.with_columns(
+                    pl.Series(
+                        "time", [t0 + i * interval_ms for i in range(n)], dtype=pl.Int64
+                    )
+                )
+            gaze.samples = gaze.samples.with_columns(
+                pl.concat_list(
+                    [
+                        pl.col("pixel").list.get(0) * gaze.experiment.screen.width_px,
+                        pl.col("pixel").list.get(1) * gaze.experiment.screen.height_px,
+                    ]
+                ).alias("pixel"),
+            )
     dataset.pix2deg()
     dataset.pos2vel(method="fivepoint")
     dataset.detect_events(
@@ -334,7 +424,9 @@ def compute_dataset_statistics(
         dispersion_threshold=dispersion_threshold,
     )
 
-    dataset.detect_events("microsaccades", minimum_duration=min_sac_dur)
+    dataset.detect_events(
+        "microsaccades", threshold=vel_threshold, minimum_duration=min_sac_dur
+    )
     dataset.compute_event_properties(["amplitude", "dispersion", "peak_velocity"])
     print("  Preprocessing complete")
 
@@ -405,7 +497,7 @@ def compute_dataset_statistics(
 
     # ── Fixation statistics ────────────────────────────────────────────────
     fix_dur_samples = fix_all["duration"].to_numpy().astype(float)
-    fix_dur_ms = fix_dur_samples / sr * 1000.0
+    fix_dur_ms = fix_dur_samples
     n_fix_per_rec = np.array([len(f) for f in all_fix_df], dtype=float)
 
     fix_stats = {
@@ -750,7 +842,7 @@ def _plot_fixation_duration(fix_dur_ms: np.ndarray, out_path: Path):
         color="#CCCCCC",
         alpha=0.3,
         zorder=0,
-        label="Physiological range",
+        label="Plausible range",
     )
     ax.set_xlabel("Fixation duration (ms)")
     ax.set_ylabel("Density")
@@ -789,7 +881,7 @@ def _plot_saccade_amplitude(sac_amp: np.ndarray, out_path: Path):
         color="#CCCCCC",
         alpha=0.3,
         zorder=0,
-        label="plausible range",
+        label="Plausible range",
     )
     ax.set_xlabel("Saccade amplitude (°)")
     ax.set_ylabel("Density")
@@ -1227,14 +1319,18 @@ def _parse():
     )
     p.add_argument(
         "--root",
-        default=r"C:\Users\saphi\PycharmProjects\thesis\data",
+        default=r"/home/janhof/thesis/data",
         help="Root directory for pymovements data",
     )
-    p.add_argument("--out_dir", default="dataset_stats", help="Output directory")
+    p.add_argument(
+        "--out_dir",
+        default="/home/janhof/thesis/logs/dataset_stats",
+        help="Output directory",
+    )
     p.add_argument(
         "--context_len",
         type=int,
-        default=2000,
+        default=3200,
         help="Context length used to estimate training sequences",
     )
     p.add_argument(
@@ -1246,25 +1342,25 @@ def _parse():
     p.add_argument(
         "--vel_threshold",
         type=float,
-        default=30.0,
-        help="IVT velocity threshold in deg/s",
+        default=30,
+        help="IDT threshold 30 for ggtg and 0.003 for mfcw",
     )
     p.add_argument(
         "--dispersion_threshold",
         type=float,
         default=1.0,
-        help="IDT dispresion threshold in deg/visual angle",
+        help="IDT dispresion threshold in deg/visual angle 1 for ggtg and 0.0001 for mfcw",
     )
     p.add_argument(
         "--min_fix_dur",
         type=int,
-        default=100,
+        default=98,
         help="Minimum fixation duration in samples",
     )
     p.add_argument(
         "--min_sac_dur",
         type=int,
-        default=10,
+        default=18,
         help="Minimum saccade duration in samples",
     )
     p.add_argument(
@@ -1276,6 +1372,7 @@ def _parse():
 def main():
     args = _parse()
     subset = {"subject_id": args.subjects} if args.subjects else None
+    print(subset)
     run_dataset_stats(
         datasets=args.datasets,
         root=args.root,

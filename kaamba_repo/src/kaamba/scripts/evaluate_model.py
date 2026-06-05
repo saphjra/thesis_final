@@ -58,9 +58,7 @@ from tqdm import tqdm
 # Project imports
 # ---------------------------------------------------------------------------
 from kaamba.net.models.kaamba import build_gaze_predictor
-from kaamba.net.models.kaamba_categorical import (
-    build_categorical_gaze_predictor,
-)
+from kaamba.utils.gaze_eval import generate_sequences
 
 
 # ---------------------------------------------------------------------------
@@ -88,51 +86,6 @@ class SequenceGenerator(ABC):
         device: str = "cpu",
     ) -> np.ndarray:
         """Return (N, gen_len, 2) float32 array of normalised gaze in [0,1]."""
-
-
-def generate_sequences(
-    model,
-    images,  # torch.Tensor (N, 3, H, W)
-    seed_len: int = 10,
-    gen_len: int = 200,
-    temperature: float = 1.0,
-    device: str = "cuda",
-) -> np.ndarray:
-    """
-    Autoregressively sample from a trained GazePredictor.
-    Returns (N, gen_len, 2) numpy array in normalised [0,1].
-    """
-    import torch
-
-    model.eval()
-    N = images.shape[0]
-    images = images.to(device)
-    generated = torch.full((N, 2, seed_len), 0.5, device=device)
-
-    with torch.no_grad():
-        for _ in range(gen_len - seed_len):
-            pi, mu, log_sx, log_sy, rho_raw = model(images, generated)
-            pi_t = torch.softmax(pi[:, -1, :], dim=-1)  # (N, K)
-            mu_t = mu[:, -1, :, :]  # (N, K, 2)
-            sx_t = log_sx[:, -1, :].exp().clamp(1e-4) * temperature
-            sy_t = log_sy[:, -1, :].exp().clamp(1e-4) * temperature
-            rho_t = torch.tanh(rho_raw[:, -1, :]) * 0.99
-
-            k_idx = torch.multinomial(pi_t, 1).squeeze(-1)  # (N,)
-            mu_k = mu_t[torch.arange(N), k_idx]  # (N, 2)
-            sx_k = sx_t[torch.arange(N), k_idx]
-            sy_k = sy_t[torch.arange(N), k_idx]
-            rho_k = rho_t[torch.arange(N), k_idx]
-
-            z1 = torch.randn(N, device=device)
-            z2 = torch.randn(N, device=device)
-            x_t = mu_k[:, 0] + sx_k * z1
-            y_t = mu_k[:, 1] + sy_k * (rho_k * z1 + (1 - rho_k**2).sqrt() * z2)
-
-            new_pt = torch.stack([x_t, y_t], dim=1).unsqueeze(-1)
-            generated = torch.cat([generated, new_pt], dim=-1)
-
-    return generated.permute(0, 2, 1).cpu().numpy()  # (N, T, 2)
 
 
 # ── GMM model (kaamba.py) ────────────────────────────────────────────────────
@@ -175,58 +128,6 @@ class GMMModelGenerator(SequenceGenerator):
                 temperature=self.temperature,
                 device=device,
             )  # (N, gen_len, 2)
-
-
-# ── Categorical model (kaamba_categorical.py) ────────────────────────────────
-
-
-class CategoricalModelGenerator(SequenceGenerator):
-    """Load a trained categorical checkpoint and generate via multinomial sampling."""
-
-    def __init__(
-        self,
-        checkpoint_path: str,
-        temperature: float = 1.0,
-        device: str = "cpu",
-        label: Optional[str] = None,
-    ):
-        self.device = device
-        self.temperature = temperature
-        ckpt = torch.load(checkpoint_path, map_location=device)
-        model_config = ckpt["config"]["model_config"]
-        self.model = build_categorical_gaze_predictor(**model_config, verbose=False)
-        self.model.load_state_dict(ckpt["model_state_dict"])
-        self.model = self.model.to(device).eval()
-        self.n_bins = self.model.n_bins
-        run_name = Path(checkpoint_path).parent.parent.name
-        self.name = label or f"categorical_{run_name}"
-        print(
-            f"[{self.name}] loaded categorical model "
-            f"(n_bins={self.n_bins}, "
-            f"{sum(p.numel() for p in self.model.parameters()):,} params)"
-        )
-
-    def generate(self, img_path, n, gen_len, seed_len, experiment, device=None):
-        device = device or self.device
-        n_bins = self.n_bins
-        temp = self.temperature
-        img_t = _load_image_tensor(img_path, device).expand(n, -1, -1, -1)
-        seq = torch.full((n, 2, seed_len), 0.5, device=device)
-
-        with torch.no_grad():
-            for _ in range(gen_len - seed_len):
-                lx, ly = self.model(img_t, seq)  # each (N, n_bins, T)
-                # last-step logits → (N, n_bins)
-                px = (lx[:, :, -1] / temp).softmax(dim=1)
-                py = (ly[:, :, -1] / temp).softmax(dim=1)
-                xb = torch.multinomial(px, 1).squeeze(1).float()
-                yb = torch.multinomial(py, 1).squeeze(1).float()
-                xc = (xb + 0.5) / n_bins
-                yc = (yb + 0.5) / n_bins
-                nxt = torch.stack([xc, yc], dim=1).unsqueeze(2)  # (N,2,1)
-                seq = torch.cat([seq, nxt], dim=2)
-
-        return seq.permute(0, 2, 1).cpu().numpy()  # (N, T, 2)
 
 
 # ── Synthetic step-function baseline ─────────────────────────────────────────
@@ -710,7 +611,6 @@ def run_evaluation(
     # ── Screen info from first gaze object ───────────────────────────────
     first_gaze = dataset.gaze[0]
     screen = first_gaze.experiment.screen
-    sr = first_gaze.experiment.sampling_rate
     scr_w_px = screen.width_px
     scr_h_px = screen.height_px
 
@@ -1577,13 +1477,13 @@ def _add_common_args(sp) -> None:
     sp.add_argument(
         "--min_fix_dur",
         type=int,
-        default=90,  # divide by 120 for mfcw
+        default=90,
         help="Minimum fixation duration in samples",
     )
     sp.add_argument(
         "--min_sac_dur",
         type=int,
-        default=30,  # divide by 120 for mfcw
+        default=30,
         help="Minimum fixation duration in samples",
     )
     sp.add_argument(
@@ -1645,19 +1545,6 @@ Config file (--config):
     )
     _add_common_args(model_p)
 
-    # ── categorical ────────────────────────────────────────────────────────
-    cat_p = sub.add_parser(
-        "categorical", help="Evaluate a trained categorical checkpoint"
-    )
-    cat_p.add_argument(
-        "--checkpoint",
-        default=None,
-        help="Path to best_model.pt (required unless set via --config)",
-    )
-    cat_p.add_argument("--temperature", type=float, default=1.0)
-    cat_p.add_argument("--label", default=None)
-    _add_common_args(cat_p)
-
     # ── synthetic ──────────────────────────────────────────────────────────
     syn_p = sub.add_parser(
         "synthetic", help="Synthetic step-function baseline (no model needed)"
@@ -1692,7 +1579,6 @@ Config file (--config):
 
     return p, {
         "model": model_p,
-        "categorical": cat_p,
         "synthetic": syn_p,
         "compare": cmp_p,
     }
@@ -1796,12 +1682,6 @@ def main():
         )
         run_evaluation(gen, **common)
 
-    elif args.mode == "categorical":
-        gen = CategoricalModelGenerator(
-            args.checkpoint, args.temperature, args.device, args.label
-        )
-        run_evaluation(gen, **common)
-
     elif args.mode == "synthetic":
         gen = SyntheticGenerator(
             fix_dur_mean_ms=args.fix_dur_mean,
@@ -1821,12 +1701,7 @@ def main():
             generators.append(
                 GMMModelGenerator(args.checkpoint, args.temperature, args.device)
             )
-        if args.cat_checkpoint:
-            generators.append(
-                CategoricalModelGenerator(
-                    args.cat_checkpoint, args.temperature, args.device
-                )
-            )
+
         if args.also_synthetic:
             generators.append(SyntheticGenerator())
         if not generators:
