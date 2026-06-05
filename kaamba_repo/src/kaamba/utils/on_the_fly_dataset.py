@@ -101,9 +101,27 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
         # add subject id and stimulus to the gaze dataframe for further processing
         # Dataset specific preprocesing
         if dataset_name == "GazeBase":
+            # x and y are already in dva have to be back transformed :
+            self.pm_dataset.deg2pix()
             self.gazeframes = pl.concat(
                 [
-                    gaze.samples.with_columns(
+                    gaze.samples.select(["pixel", "time"]).with_columns(
+                        # Normalise in-place using this gaze object's screen resolution.
+                        # Values outside [0,1] (off-screen gaze) are kept as-is —
+                        # they are valid signal (e.g. -0.02 = just off the left edge).
+                        pl.concat_list(
+                            [
+                                pl.col("pixel")
+                                .list.get(0)
+                                .fill_null(strategy="forward")
+                                / gaze.experiment.screen.width_px,
+                                # Todo have to make this preprocessing transparent
+                                pl.col("pixel")
+                                .list.get(1)
+                                .fill_null(strategy="forward")
+                                / gaze.experiment.screen.height_px,
+                            ]
+                        ).alias("pixel"),
                         pl.lit(gaze.metadata["subject_id"]).alias("subject_id"),
                         pl.lit(
                             f"R{gaze.metadata['round_id']}S{gaze.metadata['session_id']}"
@@ -113,7 +131,6 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
                 ]
             )
             self.gazeframes.head()
-            self.gazeframes = self.gazeframes.rename({"position": "pixel"})
 
         elif dataset_name == "mcfw-gaze":
             self.gazeframes = pl.concat(
@@ -401,7 +418,10 @@ def create_on_the_fly_loader(
     if dataset_name is not None:
         if dataset_name == "GGTG":
             print("subset loading by stimulus not supported, has to be passed as none")
-            subset = {"subject_id": subset["subject_id"]}
+            try:
+                subset = {"subject_id": subset["subject_id"]}
+            except TypeError:
+                subset = None
 
         # Guard: if the subset contains no subjects there is nothing to load
         if subset is not None:
@@ -423,7 +443,7 @@ def create_on_the_fly_loader(
             raise ValueError(f"Unknown dataset type: {dataset_type}")
 
     else:
-        raise ValueError("Either metadata_path or dataset_name must be provided")
+        raise ValueError("dataset_name must be provided")
 
     # prefetch_factor can only be used with num_workers > 0
     dataloader_kwargs = {
@@ -431,11 +451,14 @@ def create_on_the_fly_loader(
         "num_workers": 0,
         "pin_memory": False,
         "prefetch_factor": None,
+        "persistent_workers": None,
     }
 
     if num_workers > 0:
         dataloader_kwargs["prefetch_factor"] = 2
         dataloader_kwargs["num_workers"] = num_workers
+        dataloader_kwargs["pin_memory"] = True
+        dataloader_kwargs["persistent_workers"] = True
     print(f"Raw gaze rows: {len(dataset.gazeframes)}")
     print(dataset.gazeframes.head())
 
@@ -467,7 +490,22 @@ if __name__ == "__main__":
         "root": "/home/janhof/thesis/data/",
     }
 
-    val_loader = create_on_the_fly_loader(**config_GGTG)
+    config_Gazebase = {
+        "dataset_name": "GazeBase",
+        "context_len": 32,
+        "batch_size": 128,
+        "sampling_step": 100,
+        "stride": 100,
+        "max_image_size": 224,
+        "root": "/home/janhof/thesis/data/",
+        "subset": {
+            "subject_id": [288],
+            "round_id": [1],
+            "task_name": ["TEX"],
+        },
+    }
+
+    val_loader = create_on_the_fly_loader(**config_Gazebase)
 
     # Iterate - sequences generated on-demand
     print("\nIterating over batches (sequences generated on-the-fly):")

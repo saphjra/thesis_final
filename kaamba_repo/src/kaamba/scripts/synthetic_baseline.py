@@ -133,7 +133,6 @@ def _build_steps_and_values(
 
     # Generate events until we fill ``length`` samples
     cursor = 0
-    prev_fix: Optional[Tuple[float, float]] = None
 
     while cursor < length:
         # ── fixation ──────────────────────────────────────────────────────
@@ -270,10 +269,6 @@ def generate_synthetic_gaze_random(
     if values_center is None:
         values_center = (sw / 2, sh / 2)
 
-    # Reconstruct experiment from dataset
-    exp = pm_dataset.gaze[0].experiment
-    screen = exp.screen
-
     # Build the experiment object for the generated gaze
     exp_kwargs = dict(
         screen_width_px=sw,
@@ -341,7 +336,7 @@ def generate_synthetic_gaze_random(
                 f"  [{i + 1:>3}/{n_recordings}] length={avg_len}  "
                 f"steps={len(steps)}  ~{n_fix} fixations"
             )
-
+    print(results)
     return results
 
 
@@ -354,12 +349,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="Generate synthetic gaze baselines from a pm.Dataset"
     )
-    parser.add_argument("--dataset", default="mcfw-gaze")
-    parser.add_argument("--root", default="/home/janhof/thesis/data/")
+    parser.add_argument("--dataset", default="GGTG")
+    parser.add_argument("--root", default=r"C:\Users\saphi\PycharmProjects\thesis\data")
     parser.add_argument(
         "--subset",
         type=dict,
-        default={"subject_id": ["001"], "trial_id": ["1", ",2", "3"]},
+        default={"subject_id": ["P01"]},  # "trial_id": ["1", ",2", "3"]},
     )
     parser.add_argument("--n_recordings", type=int, default=5)
     parser.add_argument("--noise", type=float, default=15.0)

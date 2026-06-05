@@ -59,6 +59,7 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 from kaamba.net.models.kaamba import build_gaze_predictor
 from kaamba.utils.gaze_eval import generate_sequences
+from kaamba.utils.gaze_preprocessing import GazePreprocessor
 
 
 # ---------------------------------------------------------------------------
@@ -615,29 +616,19 @@ def run_evaluation(
     scr_h_px = screen.height_px
 
     # ── Preprocess entire dataset with pymovements built-ins ──────────────
-    # This runs once on the stored polars frames — no cloning, no manual
-    # numpy velocity computation.  After these calls every gaze object in
-    # dataset.gaze has  position  and  velocity  columns, and every entry in
-    # dataset.events has  fixation  and  saccade  rows with amplitude /
-    # dispersion / peak_velocity properties already populated.
     print(
-        "[eval] Preprocessing: pix2deg → pos2vel → ID-T → microsaccades → "
+        "[eval] Preprocessing: pix2deg → pos2vel → IDT → microsaccades → "
         "event properties …"
     )
-
-    dataset.pix2deg()
-    dataset.pos2vel(method=vel_method)
-    dataset.save_preprocessed()
-
-    dataset.detect_events(
-        "idt",
+    preprocessor = GazePreprocessor(
+        vel_threshold=vel_threshold,
         dispersion_threshold=dispersion_threshold,
-        clear=True,
-        minimum_duration=min_fix_duration,
+        min_fix_duration=min_fix_duration,
+        min_sac_duration=min_sac_duration,
+        vel_method=vel_method,
     )
-    dataset.detect_events("fill")
-
-    dataset.compute_event_properties(["amplitude", "dispersion", "peak_velocity"])
+    preprocessor.apply_dataset(dataset, dataset_name)
+    dataset.save_preprocessed()
     dataset.save_events()
     print(f"[eval] Preprocessing complete — {len(dataset.gaze)} recordings ready")
 
@@ -764,18 +755,7 @@ def run_evaluation(
                 experiment=first_gaze.experiment,
             )
             try:
-                g_fake.pix2deg()
-                g_fake.pos2vel(method=vel_method)
-                g_fake.detect(
-                    "idt",
-                    clear=True,
-                    minimum_duration=min_fix_duration,
-                    dispersion_threshold=dispersion_threshold,
-                )
-                g_fake.detect("microsaccades", minimum_duration=min_sac_duration)
-                g_fake.compute_event_properties(
-                    ["amplitude", "dispersion", "peak_velocity"]
-                )
+                preprocessor.apply_gaze(g_fake)
                 pos_f = np.stack(g_fake.samples["position"].to_numpy())
                 time_f = g_fake.samples["time"].to_numpy()
                 ev_df = g_fake.events.frame
@@ -1604,13 +1584,13 @@ def test():
         dataset_name="GGTG",
         root=r"C:\Users\saphi\PycharmProjects\thesis\data",
         out_dir=r"C:\Users\saphi\PycharmProjects\thesis\eval_results",
-        # subset={"subject_id": ["P01"]},
+        subset={"subject_id": ["P01"]},
         n_generate=20,
         seed_len=32,
         gen_len=2000,  # for each subject's recording of  stimulus, extracts normalized (x,y) gaze coordinates as sliding windows of length gen_len.
         dispersion_threshold=1.0,
-        min_fix_duration=90,
-        min_sac_duration=30,
+        min_fix_duration=98,
+        min_sac_duration=18,
         vel_method="fivepoint",
         device="cuda" if torch.cuda.is_available() else "cpu",
     )

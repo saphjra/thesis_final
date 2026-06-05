@@ -59,6 +59,8 @@ from scipy import stats
 from scipy.ndimage import gaussian_filter
 from tqdm import tqdm
 
+from kaamba.utils.gaze_preprocessing import GazePreprocessor
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -387,47 +389,17 @@ def compute_dataset_statistics(
     print(f"  Recordings: {len(dataset.gaze)}")
 
     # ── Preprocess entire dataset with pymovements built-ins ──────────────
-    # Runs once on the stored polars frames — no cloning, no manual velocity.
     print(
         "  Preprocessing: pix2deg → pos2vel → IDT → microsaccades → event properties …"
     )
-    if dataset_name == "mcfw-gaze":
-        # dataset is in seconds instead of milliseconds and then with non constants intervals which is expected by idt
-        # additionally the normalization of the screen coordinates is reversed to make comparable
-
-        interval_ms = int(round(1000 / sr))  # e.g. 8 for 120 Hz
-        min_fix_dur = max(interval_ms, (min_fix_dur // interval_ms) * interval_ms)
-        min_sac_dur = max(interval_ms, (min_sac_dur // interval_ms) * interval_ms)
-
-        for gaze in dataset.gaze:
-            if "time" in gaze.samples.columns:
-                t0 = int(round(float(gaze.samples["time"][0]) * 1000))
-                n = len(gaze.samples)
-                gaze.samples = gaze.samples.with_columns(
-                    pl.Series(
-                        "time", [t0 + i * interval_ms for i in range(n)], dtype=pl.Int64
-                    )
-                )
-            gaze.samples = gaze.samples.with_columns(
-                pl.concat_list(
-                    [
-                        pl.col("pixel").list.get(0) * gaze.experiment.screen.width_px,
-                        pl.col("pixel").list.get(1) * gaze.experiment.screen.height_px,
-                    ]
-                ).alias("pixel"),
-            )
-    dataset.pix2deg()
-    dataset.pos2vel(method="fivepoint")
-    dataset.detect_events(
-        "idt",
-        minimum_duration=min_fix_dur,
+    preprocessor = GazePreprocessor(
+        vel_threshold=vel_threshold,
         dispersion_threshold=dispersion_threshold,
+        min_fix_duration=min_fix_dur,
+        min_sac_duration=min_sac_dur,
+        vel_method="fivepoint",
     )
-
-    dataset.detect_events(
-        "microsaccades", threshold=vel_threshold, minimum_duration=min_sac_dur
-    )
-    dataset.compute_event_properties(["amplitude", "dispersion", "peak_velocity"])
+    preprocessor.apply_dataset(dataset, dataset_name)
     print("  Preprocessing complete")
 
     # ── Iterate over recordings (position / events already populated) ─────
@@ -660,8 +632,6 @@ def compute_dataset_statistics(
             "sampling_rate_hz": float(sr),
             "screen_width_px": int(scr_w_px),
             "screen_height_px": int(scr_h_px),
-            "screen_w_deg": float(scr_w_deg),
-            "screen_h_deg": float(scr_h_deg),
         },
         "data_volume": volume_stats,
         "fixations": fix_stats,
@@ -1319,12 +1289,12 @@ def _parse():
     )
     p.add_argument(
         "--root",
-        default=r"/home/janhof/thesis/data",
+        default=r"C:\Users\saphi\PycharmProjects\thesis\data",
         help="Root directory for pymovements data",
     )
     p.add_argument(
         "--out_dir",
-        default="/home/janhof/thesis/logs/dataset_stats",
+        default=r"C:\Users\saphi\PycharmProjects/thesis/logs/dataset_stats",
         help="Output directory",
     )
     p.add_argument(
@@ -1364,7 +1334,7 @@ def _parse():
         help="Minimum saccade duration in samples",
     )
     p.add_argument(
-        "--subjects", nargs="*", default=None, help="Limit to specific subject IDs"
+        "--subjects", nargs="*", default=["P01"], help="Limit to specific subject IDs"
     )
     return p.parse_args()
 
