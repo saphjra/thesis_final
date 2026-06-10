@@ -766,7 +766,7 @@ def run_hparam_search(
         lr = trial.suggest_float("lr", 1e-6, 1e-3, log=True)
         weight_decay = trial.suggest_float("weight_decay", 1e-7, 1e-3, log=True)
         grad_clip = trial.suggest_float("grad_clip", 0.1, 2.0)
-        batch_size = trial.suggest_categorical("batch_size", [256, 512])
+        batch_size = trial.suggest_categorical("batch_size", [64, 128])
 
         try:
             _, best_val = train_on_the_fly(
@@ -968,21 +968,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # ── train-only ────────────────────────────────────────────────────────
     p.add_argument("--num_epochs", type=int, default=100)
-    p.add_argument("--batch_size", type=int, default=512)
-    p.add_argument("--lr", type=float, default=0.00014293225713757568)
-    p.add_argument("--weight_decay", type=float, default=1.49611258828362e-06)
-    p.add_argument("--grad_clip", type=float, default=0.8121195670502164)
-    p.add_argument("--patience", type=int, default=5)
+    p.add_argument("--batch_size", type=int, default=None)
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--weight_decay", type=float, default=None)
+    p.add_argument("--grad_clip", type=float, default=None)
+    p.add_argument("--patience", type=int, default=4)
     p.add_argument("--resume_from", default=None)
     p.add_argument("--use_wandb", action="store_true")
 
     # ── search-only ───────────────────────────────────────────────────────
     p.add_argument("--n_trials", type=int, default=50)
-    p.add_argument("--n_epochs_per_trial", type=int, default=8)
+    p.add_argument("--n_epochs_per_trial", type=int, default=5)
     p.add_argument("--max_batches_per_epoch", type=int, default=512)
-    p.add_argument(
-        "--study_name", default="gaze_mamba_search_only_mfcw_gaze_context_200_siglip"
-    )
+    p.add_argument("--study_name", default="gaze_mamba_search_mixed")
     p.add_argument("--storage", default=None)
 
     return p
@@ -990,7 +988,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 # Hardcoded fallback exclude lists (used when --exclude_* is not set via CLI
 # or config file).
-_DEFAULT_EXCLUDE_PARTICIPANTS_TRAIN = ["P01", "P02"]
+_DEFAULT_EXCLUDE_PARTICIPANTS_TRAIN = []
 _DEFAULT_EXCLUDE_STIMULI_TRAIN = []
 _DEFAULT_EXCLUDE_TRIALS_TRAIN = ["", "4", "5"]
 _DEFAULT_EXCLUDE_PARTICIPANTS_SEARCH = [
@@ -1001,9 +999,10 @@ _DEFAULT_EXCLUDE_PARTICIPANTS_SEARCH = [
     "P05",
     "P06",
     "P07",
-    "P08",
-    "001",
-    "002",
+    "P18",
+    "P19",
+    "P20",
+    "P21",
     "015",
     "014",
     "013",
@@ -1057,7 +1056,7 @@ def main():
             model_config=model_config,
             dataset_name=args.datasets,
             root=args.root,
-            split_strategy="stimuli",
+            split_strategy="stimulus",
             context_len=args.context_len,
             sampling_step=args.sampling_step,
             max_image_size=args.max_image_size,

@@ -14,8 +14,11 @@ from torch.utils.data import IterableDataset, DataLoader
 import numpy as np
 import polars as pl
 from pathlib import Path
-from typing import Iterator, Dict, Optional
+from typing import Iterator, Dict, Optional, List
 import os
+import hashlib
+import pickle
+import json
 import pymovements as pm
 from tqdm import tqdm
 
@@ -57,6 +60,8 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
         stride: Optional[int] = 32,
         root: Optional[str] = None,
         subset: Optional[dict] = None,
+        cache_dir: Optional[str] = "/home/janhof/thesis/data/seq_cache",
+        stimulus: Optional[List[str]] = None,
         fill_strategy: Optional[str] = None,
         **kwargs,
     ):
@@ -90,170 +95,206 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
         self.stride = stride
         self.max_image_size = max_image_size
         self.sampling_step = sampling_step
-
-        # Load pymovements dataset
-        dataset_paths = pm.DatasetPaths(root=root)
-
-        self.pm_dataset = pm.Dataset(dataset_name, path=dataset_paths)
-
-        self.pm_dataset.load(subset=subset)
-
-        # add subject id and stimulus to the gaze dataframe for further processing
-        # Dataset specific preprocesing
-        if dataset_name == "GazeBase":
-            # x and y are already in dva have to be back transformed :
-            self.pm_dataset.deg2pix()
-            self.gazeframes = pl.concat(
-                [
-                    gaze.samples.select(["pixel", "time"]).with_columns(
-                        # Normalise in-place using this gaze object's screen resolution.
-                        # Values outside [0,1] (off-screen gaze) are kept as-is —
-                        # they are valid signal (e.g. -0.02 = just off the left edge).
-                        pl.concat_list(
-                            [
-                                pl.col("pixel")
-                                .list.get(0)
-                                .fill_null(strategy="forward")
-                                / gaze.experiment.screen.width_px,
-                                # Todo have to make this preprocessing transparent
-                                pl.col("pixel")
-                                .list.get(1)
-                                .fill_null(strategy="forward")
-                                / gaze.experiment.screen.height_px,
-                            ]
-                        ).alias("pixel"),
-                        pl.lit(gaze.metadata["subject_id"]).alias("subject_id"),
-                        pl.lit(
-                            f"R{gaze.metadata['round_id']}S{gaze.metadata['session_id']}"
-                        ).alias("stimulus"),
-                    )
-                    for gaze in self.pm_dataset.gaze
-                ]
-            )
-            self.gazeframes.head()
-
-        elif dataset_name == "mcfw-gaze":
-            self.gazeframes = pl.concat(
-                [
-                    gaze.samples.select(["pixel", "time"]).with_columns(
-                        pl.concat_list(
-                            [
-                                pl.col("pixel").list.get(0),
-                                pl.col("pixel").list.get(1),
-                            ]
-                        ).alias("pixel"),
-                        pl.lit(gaze.metadata["subject_id"])
-                        .cast(pl.Utf8)
-                        .alias("subject_id"),
-                        pl.lit(gaze.metadata["stimulus"])
-                        .cast(pl.Utf8)
-                        .alias("stimulus"),
-                        # pl.lit(gaze.metadata["trial_id"]).alias("trial_id"),
-                    )
-                    # Todo implement it with the actual yaml from pm, should be smth like:
-                    for gaze in self.pm_dataset.gaze
-                ]
-            )
-        elif dataset_name == "GGTG":
-            # split data by stimulus and normalize pixel values
-            self.pm_dataset.split_gaze_data(by="stimulus")
-            self.gazeframes = pl.concat(
-                [
-                    gaze.samples.select(["pixel", "time"]).with_columns(
-                        # Normalise in-place using this gaze object's screen resolution.
-                        # Values outside [0,1] (off-screen gaze) are kept as-is —
-                        # they are valid signal (e.g. -0.02 = just off the left edge).
-                        pl.concat_list(
-                            [
-                                pl.col("pixel")
-                                .list.get(0)
-                                .fill_null(strategy="forward")
-                                / gaze.experiment.screen.width_px,  # Todo have to make this preprocessing transparent
-                                pl.col("pixel")
-                                .list.get(1)
-                                .fill_null(strategy="forward")
-                                / gaze.experiment.screen.height_px,
-                            ]
-                        ).alias("pixel"),
-                        pl.lit(gaze.metadata["subject_id"])
-                        .cast(pl.Utf8)
-                        .alias("subject_id"),
-                        pl.lit(gaze.metadata["stimulus"])
-                        .cast(pl.Utf8)
-                        .alias("stimulus"),
-                    )
-                    for gaze in self.pm_dataset.gaze
-                ]
-            )
-
-        # Concatenate all gaze frames into a single polars dataframe
-        else:
-            self.gazeframes = pl.concat(
-                [
-                    gaze.samples.select(["pixel", "time"]).with_columns(
-                        # Normalise in-place using this gaze object's screen resolution.
-                        # Values outside [0,1] (off-screen gaze) are kept as-is —
-                        # they are valid signal (e.g. -0.02 = just off the left edge).
-                        pl.concat_list(
-                            [
-                                pl.col("pixel")
-                                .list.get(0)
-                                .fill_null(strategy="forward")
-                                / gaze.experiment.screen.width_px,
-                                pl.col("pixel")
-                                .list.get(1)
-                                .fill_null(strategy="forward")
-                                / gaze.experiment.screen.height_px,
-                            ]
-                        ).alias("pixel"),
-                        pl.lit(gaze.metadata["subject_id"])
-                        .cast(pl.Utf8)
-                        .alias("subject_id"),
-                        pl.lit(gaze.metadata["stimulus"])
-                        .cast(pl.Utf8)
-                        .alias("stimulus"),
-                    )
-                    for gaze in self.pm_dataset.gaze
-                ]
-            )
-        # Convert stimuli to polars
-        grouped = self.gazeframes.group_by(["subject_id", "stimulus"])
-        self.groups = [
-            (key, group) for key, group in grouped
-        ]  # materialise once at init
-        self.stimuli = self.pm_dataset.fileinfo["ImageStimulus"]
-
         self.all_sequences = []
-        image_cache = {}  # cache transformed images by path
-        for (subject_id, stimulus), group in tqdm(
-            self.groups, desc="Pre-computing sequences"
-        ):
-            self.scaling_factor = 1
+        self.stimuli = stimulus
 
-            gaze_data = group.select("pixel").gather_every(self.stride)
+        _cache_key = hashlib.md5(
+            json.dumps(
+                {
+                    "dataset": dataset_name,
+                    "subset": str(sorted(subset.items()) if subset else None),
+                    "context_len": context_len,
+                    "stride": stride,
+                    "sampling_step": sampling_step,
+                    "max_image_size": max_image_size,
+                    "stimuli": sorted(self.stimuli) if self.stimuli else None,
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()[:16]
 
-            if len(gaze_data) < self.context_len + 1:
-                continue
+        _cache_path = Path(cache_dir) / f"{dataset_name}_{_cache_key}.pkl"
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
 
-            stimulus_row = self.stimuli.filter(pl.col("stimulus") == stimulus)
-            if stimulus_row.is_empty():
-                continue
+        if _cache_path.exists():
+            print(f"[cache] loading sequences from {_cache_path}")
+            with open(_cache_path, "rb") as f:
+                self.all_sequences = pickle.load(f)
+            print(f"[cache] loaded {len(self.all_sequences)} sequences")
+        else:
+            # Load pymovements dataset
+            dataset_paths = pm.DatasetPaths(root=root)
 
-            image_path = Path(
-                self.pm_dataset.paths.stimuli / stimulus_row["filepath"][0]
+            self.pm_dataset = pm.Dataset(dataset_name, path=dataset_paths)
+            try:
+                self.pm_dataset.load(subset=subset)
+            except pl.exceptions.NoDataError:
+                return
+
+            # add subject id and stimulus to the gaze dataframe for further processing
+            # Dataset specific preprocesing
+            if dataset_name == "GazeBase":
+                # x and y are already in dva have to be back transformed :
+                self.pm_dataset.deg2pix()
+                self.gazeframes = pl.concat(
+                    [
+                        gaze.samples.select(["pixel", "time"]).with_columns(
+                            # Normalise in-place using this gaze object's screen resolution.
+                            # Values outside [0,1] (off-screen gaze) are kept as-is —
+                            # they are valid signal (e.g. -0.02 = just off the left edge).
+                            pl.concat_list(
+                                [
+                                    pl.col("pixel")
+                                    .list.get(0)
+                                    .fill_null(strategy="forward")
+                                    / gaze.experiment.screen.width_px,
+                                    # Todo have to make this preprocessing transparent
+                                    pl.col("pixel")
+                                    .list.get(1)
+                                    .fill_null(strategy="forward")
+                                    / gaze.experiment.screen.height_px,
+                                ]
+                            ).alias("pixel"),
+                            pl.lit(gaze.metadata["subject_id"]).alias("subject_id"),
+                            pl.lit(
+                                f"R{gaze.metadata['round_id']}S{gaze.metadata['session_id']}"
+                            ).alias("stimulus"),
+                        )
+                        for gaze in self.pm_dataset.gaze
+                    ]
+                )
+                self.gazeframes.head()
+
+            elif dataset_name == "mcfw-gaze":
+                self.gazeframes = pl.concat(
+                    [
+                        gaze.samples.select(["pixel", "time"]).with_columns(
+                            pl.concat_list(
+                                [
+                                    pl.col("pixel").list.get(0),
+                                    pl.col("pixel").list.get(1),
+                                ]
+                            ).alias("pixel"),
+                            pl.lit(gaze.metadata["subject_id"])
+                            .cast(pl.Utf8)
+                            .alias("subject_id"),
+                            pl.lit(gaze.metadata["stimulus"])
+                            .cast(pl.Utf8)
+                            .alias("stimulus"),
+                            # pl.lit(gaze.metadata["trial_id"]).alias("trial_id"),
+                        )
+                        # Todo implement it with the actual yaml from pm, should be smth like:
+                        for gaze in self.pm_dataset.gaze
+                    ]
+                )
+            elif dataset_name == "GGTG":
+                # split data by stimulus and normalize pixel values
+                self.pm_dataset.split_gaze_data(by="stimulus")
+                self.gazeframes = pl.concat(
+                    [
+                        gaze.samples.select(["pixel", "time"]).with_columns(
+                            # Normalise in-place using this gaze object's screen resolution.
+                            # Values outside [0,1] (off-screen gaze) are kept as-is —
+                            # they are valid signal (e.g. -0.02 = just off the left edge).
+                            pl.concat_list(
+                                [
+                                    pl.col("pixel")
+                                    .list.get(0)
+                                    .fill_null(strategy="forward")
+                                    / gaze.experiment.screen.width_px,  # Todo have to make this preprocessing transparent
+                                    pl.col("pixel")
+                                    .list.get(1)
+                                    .fill_null(strategy="forward")
+                                    / gaze.experiment.screen.height_px,
+                                ]
+                            ).alias("pixel"),
+                            pl.lit(gaze.metadata["subject_id"])
+                            .cast(pl.Utf8)
+                            .alias("subject_id"),
+                            pl.lit(gaze.metadata["stimulus"])
+                            .cast(pl.Utf8)
+                            .alias("stimulus"),
+                        )
+                        for gaze in self.pm_dataset.gaze
+                        if self.stimuli is None
+                        or gaze.metadata["stimulus"] in self.stimuli
+                    ]
+                )
+
+            # Concatenate all gaze frames into a single polars dataframe
+            else:
+                self.gazeframes = pl.concat(
+                    [
+                        gaze.samples.select(["pixel", "time"]).with_columns(
+                            # Normalise in-place using this gaze object's screen resolution.
+                            # Values outside [0,1] (off-screen gaze) are kept as-is —
+                            # they are valid signal (e.g. -0.02 = just off the left edge).
+                            pl.concat_list(
+                                [
+                                    pl.col("pixel")
+                                    .list.get(0)
+                                    .fill_null(strategy="forward")
+                                    / gaze.experiment.screen.width_px,
+                                    pl.col("pixel")
+                                    .list.get(1)
+                                    .fill_null(strategy="forward")
+                                    / gaze.experiment.screen.height_px,
+                                ]
+                            ).alias("pixel"),
+                            pl.lit(gaze.metadata["subject_id"])
+                            .cast(pl.Utf8)
+                            .alias("subject_id"),
+                            pl.lit(gaze.metadata["stimulus"])
+                            .cast(pl.Utf8)
+                            .alias("stimulus"),
+                        )
+                        for gaze in self.pm_dataset.gaze
+                    ]
+                )
+            # Convert stimuli to polars
+            grouped = self.gazeframes.group_by(["subject_id", "stimulus"])
+            self.groups = [
+                (key, group) for key, group in grouped
+            ]  # materialise once at init
+            image_stimuli = self.pm_dataset.fileinfo["ImageStimulus"]
+
+            image_cache = {}
+            for (subject_id, stimulus), group in tqdm(
+                self.groups, desc="Pre-computing sequences"
+            ):
+                self.scaling_factor = 1
+                gaze_data = group.select("pixel")
+
+                if len(gaze_data) < self.context_len + 1:
+                    continue
+
+                stimulus_row = image_stimuli.filter(pl.col("stimulus") == stimulus)
+                if stimulus_row.is_empty():
+                    continue
+
+                image_path = Path(
+                    self.pm_dataset.paths.stimuli / stimulus_row["filepath"][0]
+                )
+                if image_path not in image_cache:
+                    image_cache[image_path] = self._image_transform(image_path)
+                transformed_image = image_cache[image_path]
+
+                seqs = list(self._generate_sequences(gaze_data, transformed_image))
+                self.all_sequences.extend(seqs)
+
+            print(
+                f"Pre-computed {len(self.all_sequences)} sequences, "
+                f"{len(image_cache)} unique images cached"
             )
-            # Only load/transform each image once
-            if image_path not in image_cache:
-                image_cache[image_path] = self._image_transform(image_path)
-            transformed_image = image_cache[image_path]
 
-            seqs = list(self._generate_sequences(gaze_data, transformed_image))
-            self.all_sequences.extend(seqs)
+            with open(_cache_path, "wb") as f:
+                pickle.dump(self.all_sequences, f)
+            print(f"[cache] saved to {_cache_path}")
 
-        print(
-            f"Pre-computed {len(self.all_sequences)} sequences, "
-            f"{len(image_cache)} unique images cached"
-        )
+            print(
+                f"Pre-computed {len(self.all_sequences)} sequences, "
+                f"{len(image_cache)} unique images cached"
+            )
 
     def __iter__(self) -> Iterator[Dict]:
         """
@@ -416,12 +457,19 @@ def create_on_the_fly_loader(
     """
 
     if dataset_name is not None:
+        stimuli = None
         if dataset_name == "GGTG":
-            print("subset loading by stimulus not supported, has to be passed as none")
             try:
+                stimuli = subset.get("stimulus", None)
                 subset = {"subject_id": subset["subject_id"]}
-            except TypeError:
+
+            except (TypeError, AttributeError, KeyError):
+                stimuli = subset.get("stimulus", None)
                 subset = None
+
+                print(
+                    f"subset loading impaired, loading {dataset_name} by: subset {subset} and stimulus {stimuli} "
+                )
 
         # Guard: if the subset contains no subjects there is nothing to load
         if subset is not None:
@@ -438,6 +486,7 @@ def create_on_the_fly_loader(
                 max_image_size=max_image_size,
                 root=root,
                 subset=subset,
+                stimulus=stimuli,
             )
         else:
             raise ValueError(f"Unknown dataset type: {dataset_type}")
@@ -459,8 +508,8 @@ def create_on_the_fly_loader(
         dataloader_kwargs["num_workers"] = num_workers
         dataloader_kwargs["pin_memory"] = True
         dataloader_kwargs["persistent_workers"] = True
-    print(f"Raw gaze rows: {len(dataset.gazeframes)}")
-    print(dataset.gazeframes.head())
+    # print(f"Raw gaze rows: {len(dataset.gazeframes)}")
+    # print(dataset.gazeframes.head())
 
     return DataLoader(dataset, **dataloader_kwargs)
 
