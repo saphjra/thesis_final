@@ -434,7 +434,12 @@ def _plot_comparison(all_stats: Dict[str, Dict], out_path: Path):
 
     metrics = [
         ("fixations", "duration_mean_ms", "Fix. duration\n(ms)", None),
-        ("fixations", "pct_within_range", "Fix. in 50–800 ms\n(%)", None),
+        (
+            "fixations",
+            "pct_within_range",
+            f"Fix. in {PHYSIO_FIX_MIN_MS}–{PHYSIO_FIX_MAX_MS} ms\n(%)",
+            None,
+        ),
         ("saccades", "amplitude_mean_deg", "Saccade amplitude\n(°)", None),
         ("saccades", "main_sequence_r", "Main sequence r", 0.9),
         ("saccades", "direction_entropy_bits", "Direction entropy\n(bits)", None),

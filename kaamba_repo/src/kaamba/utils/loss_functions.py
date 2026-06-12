@@ -9,8 +9,7 @@ def gaussian_nll(mu, sigma, target):
     print(mu)
     dist = torch.distributions.Normal(mu, sigma)
     print("dist", dist)
-    nll = -dist
-
+    nll = -dist.log_prob(target).sum(-1).mean()
     print(nll)
     total_loss = nll
     return total_loss
@@ -60,12 +59,12 @@ def gmm_nll(pi_logits, mu, log_sx, log_sy, rho_raw, target):
 
     # ── activations ──────────────────────────────────────────────
     pi = torch.softmax(pi_logits, dim=-1)  # (B,T,K) sums to 1
-    sx = torch.exp(log_sx).clamp(min=1e-4)  # (B,T,K) strictly positive
-    sy = torch.exp(log_sy).clamp(min=1e-4)  # (B,T,K)
+
+    sx = torch.exp(log_sx.clamp(-6, 6)).clamp(min=1e-4)  # (B,T,K) strictly positive
+    sy = torch.exp(log_sy.clamp(-6, 6)).clamp(min=1e-4)  # (B,T,K)
     rho = torch.tanh(rho_raw) * 0.99  # (B,T,K) in (-0.99, 0.99)
     # *0.99 keeps det > 0
 
-    # ── assert shapes (remove after debugging) ───────────────────
     assert mu.shape == (B, T, K, 2), f"mu shape {mu.shape}"
     assert target.shape == (B, T, 2), f"target shape {target.shape}"
 

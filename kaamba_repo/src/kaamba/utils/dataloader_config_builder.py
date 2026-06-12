@@ -34,8 +34,6 @@ from torch.utils.data import DataLoader
 from kaamba.utils.on_the_fly_dataset import create_on_the_fly_loader
 # Add to dataloader_config_builder.py or a new utils/combined_loader.py
 
-import itertools
-
 
 class InterleavedLoader:
     """
@@ -74,10 +72,15 @@ class InterleavedLoader:
     def __iter__(self):
         lengths = self._lengths or [self._get_length(loader) for loader in self.loaders]
         max_len = max(lengths)
-        cycled = [itertools.cycle(loader) for loader in self.loaders]
+        iters = [iter(loader) for loader in self.loaders]
         for _ in range(max_len):
-            for c in cycled:
-                yield next(c)
+            for i, it in enumerate(iters):
+                try:
+                    yield next(it)
+                except StopIteration:
+                    # restart without caching — itertools.cycle would buffer all batches
+                    iters[i] = iter(self.loaders[i])
+                    yield next(iters[i])
 
     def to(self, device):
         """No-op: tensors are moved in the training loop."""
@@ -293,14 +296,17 @@ class DataloaderConfigBuilder:
             print(f"\n{'=' * 60}")
             print(f"Processing dataset: {dataset_name}")
             print(f"{'=' * 60}")
-
+            if dataset_name == "GGTG":
+                sampling_step = 8
+            else:
+                sampling_step = self.sampling_step
             # Build a single-dataset builder for each dataset
             single_builder = DataloaderConfigBuilder(
                 datasets=[dataset_name],
                 root=self.root,
                 context_len=self.context_len,
                 stride=self.stride,
-                sampling_step=self.sampling_step,
+                sampling_step=sampling_step,
                 max_image_size=self.max_image_size,
             )
 

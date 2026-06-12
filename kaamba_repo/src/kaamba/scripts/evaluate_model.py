@@ -17,10 +17,6 @@ Usage
   python evaluate_model.py model \
       --checkpoint /path/best_model.pt --dataset mcfw-gaze --root /data
 
-  # Categorical model
-  python evaluate_model.py categorical \
-      --checkpoint /path/best_cat.pt   --dataset mcfw-gaze --root /data
-
   # Synthetic baseline
   python evaluate_model.py synthetic \
       --dataset mcfw-gaze --root /data --noise 15
@@ -57,13 +53,19 @@ from tqdm import tqdm
 # Project imports
 # ---------------------------------------------------------------------------
 from kaamba.net.models.kaamba import build_gaze_predictor
-from kaamba.utils.eval_plots import plot_best_worst_comparison
+from kaamba.utils.eval_plots import (
+    plot_aggregate_metrics,
+    plot_best_worst_comparison,
+    plot_per_stimulus_metrics,
+    plot_scanpath_overview,
+)
 from kaamba.utils.eval_report import (
     aggregate_results,
     build_eval_report,
     save_comparison_table,
 )
-from kaamba.utils.gaze_eval import generate_sequences
+
+# from kaamba.utils.gaze_eval import generate_sequences
 from kaamba.utils.gaze_preprocessing import GazePreprocessor
 
 
@@ -121,12 +123,57 @@ class GMMModelGenerator(SequenceGenerator):
             f"({sum(p.numel() for p in self.model.parameters()):,} params)"
         )
 
+    def _generate_sequences(
+        self,
+        model,
+        images,  # torch.Tensor (N, 3, H, W)
+        seed_len: int = 10,
+        gen_len: int = 200,
+        temperature: float = 1.0,
+        device: str = "cuda",
+    ) -> np.ndarray:
+        """
+        Autoregressively sample from a trained GazePredictor.
+        Returns (N, gen_len, 2) numpy array in normalised [0,1].
+        """
+        import torch
+
+        model.eval()
+        N = images.shape[0]
+        images = images.to(device)
+        generated = torch.full((N, 2, seed_len), 0.5, device=device)
+
+        with torch.no_grad():
+            for _ in range(gen_len - seed_len):
+                pi, mu, log_sx, log_sy, rho_raw = model(images, generated)
+                pi_t = torch.softmax(pi[:, -1, :], dim=-1)  # (N, K)
+                mu_t = mu[:, -1, :, :]  # (N, K, 2)
+                sx_t = log_sx[:, -1, :].exp().clamp(1e-4) * temperature
+                sy_t = log_sy[:, -1, :].exp().clamp(1e-4) * temperature
+                rho_t = torch.tanh(rho_raw[:, -1, :]) * 0.99
+
+                k_idx = torch.multinomial(pi_t, 1).squeeze(-1)  # (N,)
+                mu_k = mu_t[torch.arange(N), k_idx]  # (N, 2)
+                sx_k = sx_t[torch.arange(N), k_idx]
+                sy_k = sy_t[torch.arange(N), k_idx]
+                rho_k = rho_t[torch.arange(N), k_idx]
+
+                z1 = torch.randn(N, device=device)
+                z2 = torch.randn(N, device=device)
+                x_t = mu_k[:, 0] + sx_k * z1
+                y_t = mu_k[:, 1] + sy_k * (rho_k * z1 + (1 - rho_k**2).sqrt() * z2)
+
+                new_pt = torch.stack([x_t, y_t], dim=1).unsqueeze(-1)
+                generated = torch.cat([generated, new_pt], dim=-1)
+
+        return generated.permute(0, 2, 1).cpu().numpy()  # (N, T, 2)
+
     def generate(self, img_path, n, gen_len, seed_len, experiment, device=None):
         device = device or self.device
         img_tensor = _load_image_tensor(img_path, device)  # (1, 3, 224, 224)
         imgs_batch = img_tensor.expand(n, -1, -1, -1)
         with torch.no_grad():
-            return generate_sequences(
+            return self._generate_sequences(
                 model=self.model,
                 images=imgs_batch,
                 seed_len=seed_len,
@@ -560,7 +607,6 @@ def evaluate_stimulus(
     }
 
 
-#
 def run_evaluation(
     generator: SequenceGenerator,
     dataset_name: str,
@@ -570,24 +616,38 @@ def run_evaluation(
     n_generate: int = 50,
     seed_len: int = 10,
     gen_len: int = 128,
-    vel_threshold: float = 30.0,  # deg/s IVT threshold
-    min_fix_duration: int = 100,  # samples
+    vel_threshold: float = 30.0,
+    min_fix_duration: int = 100,
     min_sac_duration: int = 30,
-    dispersion_threshold: float = 1.0,  # deg, for I-DT fixation detection
+    dispersion_threshold: float = 1.0,
     vel_method: str = "fivepoint",
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    extra_generators: Optional[List[SequenceGenerator]] = None,
+    per_stimulus_plots: bool = False,
+    scanpath_overview: bool = False,
 ) -> Dict:
     """
     Main evaluation loop.
 
-    Accepts any SequenceGenerator (GMMModelGenerator, CategoricalModelGenerator,
-    or SyntheticGenerator) and writes results to out_dir / generator.name /.
+    Accepts a primary SequenceGenerator (the model) and an optional list of
+    ``extra_generators`` (e.g. a SyntheticGenerator used as a baseline).
 
-    For each (subject, stimulus) pair in the dataset:
-      1. Load real gaze sequences
-      2. Call generator.generate() for the matching stimulus image
-      3. Run all  metrics
-      4. Save per-stimulus JSON + aggregate report
+    For each stimulus:
+      1. Load real gaze sequences and run event detection.
+      2. Generate sequences from ``generator`` (primary / model).
+      3. Optionally generate from each ``extra_generators`` entry.
+      4. Compute all metrics (primary generator vs real).
+      5. Save per-stimulus JSON + aggregate report.
+      6. Produce per-stimulus distribution plots and a best/worst figure.
+
+    The condition-keyed plot cache written to disk has the structure::
+
+        {stim_name: {
+            "img_path": Path,
+            "real":          {"seqs", "fix_df", "sac_df"},
+            generator.name:  {"seqs", "fix_df", "sac_df"},
+            extra.name:      {"seqs", "fix_df", "sac_df"},   # one per extra_generator
+        }}
     """
     out_dir = Path(out_dir) / generator.name
     stim_dir = out_dir / "per_stimulus"
@@ -610,6 +670,7 @@ def run_evaluation(
     screen = first_gaze.experiment.screen
     scr_w_px = screen.width_px
     scr_h_px = screen.height_px
+    sampling_rate = first_gaze.experiment.sampling_rate
 
     # ── Preprocess entire dataset with pymovements built-ins ──────────────
     print(
@@ -624,8 +685,8 @@ def run_evaluation(
         vel_method=vel_method,
     )
     preprocessor.apply_dataset(dataset, dataset_name)
-    dataset.save_preprocessed()
-    dataset.save_events()
+    # dataset.save_preprocessed()
+    # dataset.save_events()
     print(f"[eval] Preprocessing complete — {len(dataset.gaze)} recordings ready")
 
     # ── Group gaze objects + event frames by stimulus ─────────────────────
@@ -638,14 +699,6 @@ def run_evaluation(
 
     print(f"[eval] {len(by_stimulus)} unique stimuli\n")
 
-    # ── Build stimulus name → image path lookup ───────────────────────────
-    # dataset.stimuli is broken for some dataset configs — use fileinfo instead,
-    # matching the workaround used during training:
-    #   self.stimuli = self.pm_dataset.fileinfo["ImageStimulus"]
-    #
-    # fileinfo["ImageStimulus"] is a polars DataFrame with columns:
-    #   "stimulus"  — name matching gaze.metadata["stimulus"]
-    #   "filepath"  — path to the image file
     stim_fileinfo = dataset.fileinfo["ImageStimulus"]
     stim_images: Dict[str, Path] = {}
     for row in stim_fileinfo.iter_rows(named=True):
@@ -715,7 +768,6 @@ def run_evaluation(
         real_sac_df = pl.concat(all_real_sac) if all_real_sac else pl.DataFrame()
 
         # ── Load stimulus image via fileinfo path ────────────────────────
-        # gaze.metadata["stimulus"] is the key — same as used during training
         img_path = stim_images.get(stim_name)
         if img_path is None:
             print(f"  [skip] {stim_name}: not in fileinfo ImageStimulus")
@@ -739,12 +791,15 @@ def run_evaluation(
         all_fake_sac = []
 
         for seq in fake_norm:  # (gen_len, 2) normalised
-            px_vals = seq * np.array([scr_w_px, scr_h_px], dtype=float)
+            px_vals = seq * np.array([scr_w_px, scr_h_px], dtype=float)  # denormalize
             g_fake = pm.Gaze(
                 pl.DataFrame(
                     {
                         "x_pix": px_vals[:, 0],
                         "y_pix": px_vals[:, 1],
+                        "time": [(x + 1) * 8 for x in range(len(px_vals))]
+                        if sampling_rate == 120
+                        else [x + 1 for x in range(len(px_vals))],
                     }
                 ),
                 pixel_columns=["x_pix", "y_pix"],
@@ -754,9 +809,10 @@ def run_evaluation(
                 preprocessor.apply_gaze(g_fake)
                 pos_f = np.stack(g_fake.samples["position"].to_numpy())
                 time_f = g_fake.samples["time"].to_numpy()
-                ev_df = g_fake.events.frame
-                all_fake_fix.append(_fix_df_from_events(ev_df, pos_f, time_f))
-                all_fake_sac.append(_sac_df_from_events(ev_df, pos_f, time_f))
+                fixations = g_fake.events.fixations
+                saccades = g_fake.events.saccades
+                all_fake_fix.append(_fix_df_from_events(fixations, pos_f, time_f))
+                all_fake_sac.append(_sac_df_from_events(saccades, pos_f, time_f))
             except Exception as e:
                 tqdm.write(f"  [warn] fake event detection failed: {e}")
 
@@ -781,15 +837,74 @@ def run_evaluation(
         (stim_dir / f"{safe_name}.json").write_text(json.dumps(metrics, indent=2))
         all_results[stim_name] = metrics
 
-        # Cache raw arrays and event frames for plotting
+        # ── Generate from extra generators (e.g. synthetic baseline) ────────
+        extra_cond_data: Dict[str, dict] = {}
+        for extra_gen in extra_generators or []:
+            try:
+                extra_norm = extra_gen.generate(
+                    img_path=img_path,
+                    n=n_generate,
+                    gen_len=gen_len,
+                    seed_len=seed_len,
+                    experiment=first_gaze.experiment,
+                    device=device,
+                )
+                ex_fix_list, ex_sac_list = [], []
+                for seq in extra_norm:
+                    px_vals = seq * np.array([scr_w_px, scr_h_px], dtype=float)
+                    g_ex = pm.Gaze(
+                        pl.DataFrame(
+                            {
+                                "x_pix": px_vals[:, 0],
+                                "y_pix": px_vals[:, 1],
+                                "time": [(x + 1) * 8 for x in range(len(px_vals))]
+                                if sampling_rate == 120
+                                else [x + 1 for x in range(len(px_vals))],
+                            }
+                        ),
+                        pixel_columns=["x_pix", "y_pix"],
+                        experiment=first_gaze.experiment,
+                    )
+                    try:
+                        preprocessor.apply_gaze(g_ex)
+                        pos_ex = np.stack(g_ex.samples["position"].to_numpy())
+                        time_ex = g_ex.samples["time"].to_numpy()
+                        ex_fix_list.append(
+                            _fix_df_from_events(g_ex.events.fixations, pos_ex, time_ex)
+                        )
+                        ex_sac_list.append(
+                            _sac_df_from_events(g_ex.events.saccades, pos_ex, time_ex)
+                        )
+                    except Exception as e:
+                        tqdm.write(
+                            f"  [warn] extra gen '{extra_gen.name}' event detection failed: {e}"
+                        )
+                extra_fix_df = pl.concat(ex_fix_list) if ex_fix_list else pl.DataFrame()
+                extra_sac_df = pl.concat(ex_sac_list) if ex_sac_list else pl.DataFrame()
+                extra_cond_data[extra_gen.name] = {
+                    "seqs": extra_norm,
+                    "fix_df": extra_fix_df,
+                    "sac_df": extra_sac_df,
+                }
+            except Exception as e:
+                tqdm.write(
+                    f"  [warn] extra generator '{extra_gen.name}' failed for {stim_name}: {e}"
+                )
+
+        # ── Build condition-keyed plot cache ──────────────────────────────
         _plot_cache[stim_name] = {
-            "real_seqs": real_arr,
-            "fake_seqs": fake_norm,
-            "real_fix_df": real_fix_df,
-            "real_sac_df": real_sac_df,
-            "fake_fix_df": fake_fix_df,
-            "fake_sac_df": fake_sac_df,
             "img_path": img_path,
+            "real": {
+                "seqs": real_arr,
+                "fix_df": real_fix_df,
+                "sac_df": real_sac_df,
+            },
+            generator.name: {
+                "seqs": fake_norm,
+                "fix_df": fake_fix_df,
+                "sac_df": fake_sac_df,
+            },
+            **extra_cond_data,
         }
 
         tqdm.write(
@@ -815,14 +930,38 @@ def run_evaluation(
     print(report)
     print(f"\n[eval] Results saved to {out_dir}")
 
-    # ── Comparison plot (best vs worst matching stimulus) ─────────────────
+    # ── Aggregate metric plots (always generated) ─────────────────────────
+    plot_aggregate_metrics(
+        plot_cache=_plot_cache,
+        out_dir=out_dir / "aggregate_plots",
+        sr=sampling_rate,
+    )
+
+    # ── Best vs worst comparison (always generated) ───────────────────────
     if len(all_results) >= 2:
-        plot_path = out_dir / "comparison_best_worst.png"
         plot_best_worst_comparison(
             all_results=all_results,
             plot_cache=_plot_cache,
-            out_path=plot_path,
-            score_metric=("classifier_auc", "auc"),  # primary ranking metric
+            out_path=out_dir / "comparison_best_worst.png",
+            score_metric=("classifier_auc", "auc"),
+            primary_condition=generator.name,
+        )
+
+    # ── Per-stimulus metric plots (optional) ──────────────────────────────
+    if per_stimulus_plots:
+        plot_per_stimulus_metrics(
+            plot_cache=_plot_cache,
+            out_dir=out_dir / "per_stimulus_plots",
+            sr=sampling_rate,
+        )
+
+    # ── Scanpath overview (optional) ──────────────────────────────────────
+    if scanpath_overview:
+        plot_scanpath_overview(
+            plot_cache=_plot_cache,
+            out_path=out_dir / "scanpath_overview.png",
+            n_cols=4,
+            n_scanpaths=6,
         )
 
     return all_results
@@ -876,50 +1015,75 @@ def _load_config(path: str) -> dict:
 
 
 def _add_common_args(sp) -> None:
-    """Attach dataset / generation / event-detection flags to a subparser."""
-    sp.add_argument(
-        "--dataset", required=True, help="pymovements dataset name, e.g. mcfw-gaze"
-    )
-    sp.add_argument("--root", required=True, help="Root directory for pymovements data")
+    """Attach dataset / generation / event-detection flags tdataset name (default: mcfw-gaze)")
+    sp.add_argument("--root", required=True,
+                    help="Root directory for pyo a subparser."""
+    # Dataset
+    sp.add_argument("--dataset", default="mcfw-gaze", help="pymovements movements data")
     sp.add_argument(
         "--out_dir",
         default="eval_results",
-        help="Output root directory (generator sub-dir added automatically)",
+        help="Output root (a generator sub-dir is added automatically)",
     )
-    # Subset
-    sp.add_argument("--subjects", nargs="*", default=None)
-    sp.add_argument("--stimuli", nargs="*", default=None)
-    sp.add_argument("--trial_ids", nargs="*", default=None)
+    # Subset filters
+    sp.add_argument(
+        "--subjects", nargs="*", default=None, help="Limit to specific subject IDs"
+    )
+    sp.add_argument(
+        "--stimuli",
+        nargs="*",
+        default=[
+            "88",
+            "89",
+            "90",
+            "91",
+            "92",
+            "93",
+            "94",
+            "95",
+            "96",
+            "97",
+            "98",
+            "99",
+        ],
+        help="Limit to specific stimulus IDs",
+    )
+    sp.add_argument(
+        "--trial_ids", nargs="*", default=None, help="Limit to specific trial IDs"
+    )
     # Generation
     sp.add_argument(
-        "--n_generate", type=int, default=50, help="Sequences to generate per stimulus"
+        "--n_generate",
+        type=int,
+        default=45,
+        help="Sequences to generate per stimulus (default: 45)",
     )
     sp.add_argument("--seed_len", type=int, default=10)
-    sp.add_argument("--gen_len", type=int, default=128)
+    sp.add_argument("--gen_len", type=int, default=580)
     # Event detection
     sp.add_argument(
         "--vel_threshold",
         type=float,
         default=30.0,
-        help="IVT velocity threshold in deg/s",
+        help="IVT velocity threshold in deg/s (default: 30)",
     )
     sp.add_argument(
         "--dispersion_threshold",
         type=float,
         default=1.0,
-        help="IDT velocity threshold in deg/s",
+        help="IDT dispersion threshold in deg (default: 1.0)",
     )
     sp.add_argument(
         "--min_fix_dur",
         type=int,
-        default=90,
-        help="Minimum fixation duration in samples",
+        default=96,
+        help="Minimum fixation duration in samples (default: 96)",
     )
     sp.add_argument(
         "--min_sac_dur",
         type=int,
-        default=30,
-        help="Minimum fixation duration in samples",
+        default=16,
+        help="Minimum saccade duration in samples (default: 16)",
     )
     sp.add_argument(
         "--vel_method",
@@ -927,56 +1091,82 @@ def _add_common_args(sp) -> None:
         choices=["fivepoint", "preceding", "smooth"],
     )
     sp.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    # Optional plots
+    sp.add_argument(
+        "--per_stimulus_plots",
+        action="store_true",
+        help="Also generate individual metric plots per stimulus "
+        "(saved under per_stimulus_plots/)",
+    )
+    sp.add_argument(
+        "--scanpath_overview",
+        default=True,
+        help="Also generate the tiled scanpath overview figure",
+    )
 
 
 def _build_parser() -> tuple:
-    """Build the argument parser. Returns ``(parser, subparsers_dict)``."""
+    """Build the argument parser.  Returns ``(parser, subparsers_dict)``."""
     p = argparse.ArgumentParser(
         description="Evaluate gaze generators against real pymovements data",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Config file (--config):
-  Pass a JSON file with default values for any CLI argument so you don't
-  have to retype dataset paths, generation settings, or checkpoint locations.
-  CLI flags always override file values.
+Modes
+─────
+  model      Evaluate a trained GMM checkpoint.
+  synthetic  Evaluate the synthetic step-function baseline only.
+  compare    Evaluate a GMM checkpoint with the synthetic baseline as an extra
+             condition (equivalent to: model --also_synthetic).
 
-  Useful keys:
-    dataset, root, out_dir, checkpoint, n_generate, gen_len, seed_len,
-    vel_threshold, min_fix_dur, vel_method, device, temperature, label
+Config file (--config)
+──────────────────────
+  JSON file of default values for any CLI argument.  Explicit flags override.
 
-  Example config (eval_config.json):
+  Useful keys: dataset, root, out_dir, checkpoint, n_generate, gen_len,
+               seed_len, vel_threshold, min_fix_dur, device, temperature
+
+  Example:
     {
         "dataset":    "mcfw-gaze",
         "root":       "/data",
-        "checkpoint": "/logs/runs/trial_0019/checkpoints/best_model.pt",
+        "checkpoint": "/logs/runs/best_model.pt",
         "n_generate": 100,
         "gen_len":    256
     }
 
   Usage:
-    python evaluate_model.py model --config eval_config.json
-    python evaluate_model.py model --config eval_config.json --n_generate 200
-    python evaluate_model.py compare --config eval_config.json --also_synthetic
+    python evaluate_model.py model     --config eval_config.json
+    python evaluate_model.py model     --config eval_config.json --also_synthetic
+    python evaluate_model.py synthetic --config eval_config.json
+    python evaluate_model.py compare   --config eval_config.json
 """,
     )
     p.add_argument(
         "--config",
         default=None,
         metavar="PATH",
-        help="JSON config file.  Keys set CLI defaults; explicit flags override.",
+        help="JSON config file — keys set CLI defaults",
     )
     sub = p.add_subparsers(dest="mode", required=True)
 
     # ── model ──────────────────────────────────────────────────────────────
     model_p = sub.add_parser("model", help="Evaluate a trained GMM checkpoint")
     model_p.add_argument(
-        "--checkpoint",
-        default=None,
-        help="Path to best_model.pt (required unless set via --config)",
+        "--checkpoint", default=None, help="Path to best_model.pt (or set via --config)"
     )
-    model_p.add_argument("--temperature", type=float, default=1.0)
     model_p.add_argument(
-        "--label", default=None, help="Override generator name in output paths"
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="Sampling temperature (default: 1.0)",
+    )
+    model_p.add_argument(
+        "--label", default=None, help="Override the generator name used in output paths"
+    )
+    model_p.add_argument(
+        "--also_synthetic",
+        action="store_true",
+        help="Also run the synthetic baseline as an extra condition",
     )
     _add_common_args(model_p)
 
@@ -984,39 +1174,29 @@ Config file (--config):
     syn_p = sub.add_parser(
         "synthetic", help="Synthetic step-function baseline (no model needed)"
     )
-    syn_p.add_argument("--noise", type=float, default=5)
-    syn_p.add_argument("--values_spread", type=float, default=0.7)
-    syn_p.add_argument("--fix_dur_mean", type=float, default=250.0)
-    syn_p.add_argument("--fix_dur_std", type=float, default=80.0)
-    syn_p.add_argument("--sac_dur_mean", type=float, default=40.0)
-    syn_p.add_argument("--sac_dur_std", type=float, default=15.0)
-    syn_p.add_argument("--seed", type=int, default=42)
-    syn_p.add_argument("--label", default=None)
+    syn_p.add_argument(
+        "--label", default=None, help="Override the generator name used in output paths"
+    )
     _add_common_args(syn_p)
 
     # ── compare ────────────────────────────────────────────────────────────
     cmp_p = sub.add_parser(
-        "compare", help="Side-by-side comparison of multiple generators"
+        "compare",
+        help="GMM checkpoint + synthetic baseline (shorthand for "
+        "model --also_synthetic)",
     )
     cmp_p.add_argument(
-        "--checkpoint", default=None, help="GMM checkpoint path (optional)"
+        "--checkpoint", default=None, help="Path to best_model.pt (or set via --config)"
     )
     cmp_p.add_argument(
-        "--cat_checkpoint", default=None, help="Categorical checkpoint path (optional)"
+        "--temperature",
+        type=float,
+        default=0.5,
+        help="Sampling temperature (default: 0.5)",
     )
-    cmp_p.add_argument(
-        "--also_synthetic",
-        action="store_true",
-        help="Also include the synthetic step-function baseline",
-    )
-    cmp_p.add_argument("--temperature", type=float, default=1.0)
     _add_common_args(cmp_p)
 
-    return p, {
-        "model": model_p,
-        "synthetic": syn_p,
-        "compare": cmp_p,
-    }
+    return p, {"model": model_p, "synthetic": syn_p, "compare": cmp_p}
 
 
 def _build_subset(args) -> Optional[Dict]:
@@ -1024,7 +1204,7 @@ def _build_subset(args) -> Optional[Dict]:
     if getattr(args, "subjects", None):
         subset["subject_id"] = args.subjects
     if getattr(args, "stimuli", None):
-        subset["stimulus_id"] = args.stimuli
+        subset["stimulus"] = args.stimuli
     if getattr(args, "trial_ids", None):
         subset["trial_id"] = args.trial_ids
     return subset or None
@@ -1055,7 +1235,7 @@ def main():
     p, subparsers = _build_parser()
 
     # ── Config file: scan sys.argv directly for --config ──────────────────
-    # We scan rather than use parse_known_args() to avoid conflicts with
+    #  scan rather than use parse_known_args() to avoid conflicts with
     # required-seeming args in subparsers (e.g. --checkpoint which is now
     # optional at the parser level and validated manually below).
     _argv = sys.argv[1:]
@@ -1068,10 +1248,11 @@ def main():
             break
 
     if cfg:
-        # Identify the subcommand so we only apply relevant defaults —
-        # e.g. don't set synthetic-only keys on the model subparser.
-        _modes = {"model", "categorical", "synthetic", "compare"}
-        mode_from_argv = next((a for a in _argv if a in _modes), None)
+        # Apply config defaults only to the active subparser so that keys
+        # that don't exist on a given subparser are silently ignored.
+        mode_from_argv = next(
+            (a for a in _argv if a in {"model", "synthetic", "compare"}), None
+        )
         targets = (
             [subparsers[mode_from_argv]]
             if mode_from_argv in subparsers
@@ -1088,10 +1269,11 @@ def main():
 
     args = p.parse_args()
 
-    # ── Manual validation for args that the config file may satisfy ───────
-    if args.mode in ("model", "categorical") and not args.checkpoint:
+    # ── Validate checkpoint where required ────────────────────────────────
+    if args.mode in ("model", "compare") and not getattr(args, "checkpoint", None):
         p.error(
-            f"{args.mode} mode requires --checkpoint (or set 'checkpoint' in --config)"
+            f"'{args.mode}' mode requires --checkpoint "
+            "(or set 'checkpoint' in --config)"
         )
 
     subset = _build_subset(args)
@@ -1105,45 +1287,29 @@ def main():
         seed_len=args.seed_len,
         gen_len=args.gen_len,
         vel_threshold=args.vel_threshold,
+        dispersion_threshold=args.dispersion_threshold,
         min_fix_duration=args.min_fix_dur,
         min_sac_duration=args.min_sac_dur,
         vel_method=args.vel_method,
         device=args.device,
+        per_stimulus_plots=args.per_stimulus_plots,
+        scanpath_overview=args.scanpath_overview,
     )
 
     if args.mode == "model":
         gen = GMMModelGenerator(
             args.checkpoint, args.temperature, args.device, args.label
         )
-        run_evaluation(gen, **common)
+        extras = [SyntheticGenerator()] if args.also_synthetic else None
+        run_evaluation(gen, extra_generators=extras, **common)
 
     elif args.mode == "synthetic":
-        gen = SyntheticGenerator(
-            fix_dur_mean_ms=args.fix_dur_mean,
-            fix_dur_std_ms=args.fix_dur_std,
-            sac_dur_mean_ms=args.sac_dur_mean,
-            sac_dur_std_ms=args.sac_dur_std,
-            noise=args.noise,
-            values_spread=args.values_spread,
-            seed=args.seed,
-            label=args.label,
-        )
+        gen = SyntheticGenerator(label=getattr(args, "label", None))
         run_evaluation(gen, **common)
 
     elif args.mode == "compare":
-        generators: List[SequenceGenerator] = []
-        if args.checkpoint:
-            generators.append(
-                GMMModelGenerator(args.checkpoint, args.temperature, args.device)
-            )
-
-        if args.also_synthetic:
-            generators.append(SyntheticGenerator())
-        if not generators:
-            raise ValueError(
-                "compare mode needs at least one of --checkpoint,  or --also_synthetic"
-            )
-        run_multi_evaluation(generators, **common)
+        gen = GMMModelGenerator(args.checkpoint, args.temperature, args.device)
+        run_evaluation(gen, extra_generators=[SyntheticGenerator()], **common)
 
 
 if __name__ == "__main__":

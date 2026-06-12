@@ -156,12 +156,6 @@ MCFW_STIMULUS = [
     "99",
 ]
 
-# ---------------------------------------------------------------------------
-# pymovements-native preprocessing helpers
-# (mirrors evaluate_model.py — dataset.pix2deg / pos2vel / detect_events /
-#  compute_event_properties are called at dataset level before the loop)
-# ---------------------------------------------------------------------------
-
 _EMPTY_FIX = pl.DataFrame(
     schema={
         "name": pl.Utf8,
@@ -321,6 +315,7 @@ def compute_dataset_statistics(
     dispersion_threshold: float = 1,
     min_fix_dur: int = 100,
     min_sac_dur: int = 30,
+    vel_method: str = None,
     subset: Optional[dict] = None,
 ) -> Dict:
     """
@@ -381,7 +376,7 @@ def compute_dataset_statistics(
         dispersion_threshold=dispersion_threshold,
         min_fix_duration=min_fix_dur,
         min_sac_duration=min_sac_dur,
-        vel_method="fivepoint",
+        vel_method=vel_method,
     )
     preprocessor.apply_dataset(dataset, dataset_name)
     print("  Preprocessing complete")
@@ -616,6 +611,8 @@ def compute_dataset_statistics(
             "sampling_rate_hz": float(sr),
             "screen_width_px": int(scr_w_px),
             "screen_height_px": int(scr_h_px),
+            "screen_w_deg": float(scr_w_deg),
+            "screen_h_deg": float(scr_h_deg),
         },
         "data_volume": volume_stats,
         "fixations": fix_stats,
@@ -674,6 +671,7 @@ def run_dataset_stats(
     vel_threshold: float = 30.0,
     min_fix_dur: int = 10,
     min_sac_dur: int = 10,
+    vel_method: str = None,
     dispersion_threshold: float = 1.0,
     subset: Optional[dict] = None,
 ) -> Dict[str, Dict]:
@@ -694,6 +692,7 @@ def run_dataset_stats(
             dispersion_threshold=dispersion_threshold,
             min_sac_dur=min_sac_dur,
             min_fix_dur=min_fix_dur,
+            vel_method=vel_method,
             subset=subset,
         )
         if s:
@@ -771,6 +770,13 @@ def _parse():
         help="Minimum saccade duration in samples",
     )
     p.add_argument(
+        "--vel_method",
+        type=str,
+        default="fivepoint",
+        choices=["fivepoint", "preceding", "savitzky_golay", "neighbors"],
+        help="method to compute velocities",
+    )
+    p.add_argument(
         "--subjects", nargs="*", default=["P01"], help="Limit to specific subject IDs"
     )
     return p.parse_args()
@@ -790,6 +796,7 @@ def main():
         dispersion_threshold=args.dispersion_threshold,
         min_fix_dur=args.min_fix_dur,
         min_sac_dur=args.min_sac_dur,
+        vel_method=args.vel_method,
         subset=subset,
     )
 

@@ -255,7 +255,7 @@ def _detect_fixations(
         T = len(seq)
 
         try:
-            evs = pm.events.ivt(
+            evs = pm.events.idt(
                 velocities=vel,
                 timesteps=np.arange(T, dtype=int),
                 velocity_threshold=vel_threshold,
@@ -678,12 +678,12 @@ Config file (--config):
 
     # ── Generation ────────────────────────────────────────────────────────
     p.add_argument(
-        "--n", type=int, default=1, help="Number of scanpaths to generate  (default: 1)"
+        "--n", type=int, default=2, help="Number of scanpaths to generate  (default: 1)"
     )
     p.add_argument(
         "--gen_len",
         type=int,
-        default=128,
+        default=1600,
         help="Total sequence length in samples  (default: 128)",
     )
     p.add_argument(
@@ -695,7 +695,7 @@ Config file (--config):
     p.add_argument(
         "--temperature",
         type=float,
-        default=1.0,
+        default=0.50,
         help="Sampling temperature  (< 1 sharper, > 1 more diverse)",
     )
     p.add_argument(
@@ -748,7 +748,7 @@ Config file (--config):
         "--vel_threshold",
         type=float,
         default=30.0,
-        help="IVT velocity threshold in deg/s (default: 30)",
+        help="IDT velocity threshold in deg/s (default: 30)",
     )
     p.add_argument(
         "--min_fix_dur",
@@ -760,8 +760,8 @@ Config file (--config):
     # ── Output ────────────────────────────────────────────────────────────
     p.add_argument(
         "--out_dir",
-        default="infer_results",
-        help="Output root directory  (default: infer_results/)",
+        default="logs/infer_results",
+        help="Output root directory  (default: logs/infer_results/)",
     )
     p.add_argument(
         "--label",

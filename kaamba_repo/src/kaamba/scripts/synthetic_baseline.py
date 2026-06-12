@@ -133,6 +133,7 @@ def _build_steps_and_values(
 
     # Generate events until we fill ``length`` samples
     cursor = 0
+    prev_fix: Optional[Tuple[float, float]] = None
 
     while cursor < length:
         # ── fixation ──────────────────────────────────────────────────────
@@ -228,7 +229,7 @@ def generate_synthetic_gaze_random(
     Returns
     -------
     List of pm.Gaze objects, each of length ≈ dataset average recording length.
-    These can be passed directly to evaluate_model.py / gaze_eval.py.
+    These can be passed directly to evaluate_model.py
     """
 
     dataset_paths = pm.DatasetPaths(root=root)
@@ -401,7 +402,7 @@ def main():
         print(f"Traceplots saved to {out}")
 
     print(f"\nDone — generated {len(gazes)} synthetic pm.Gaze objects.")
-    print("Pass these to evaluate_model.py / gaze_eval.py for baseline comparison.")
+    print("Pass these to evaluate_model.py for baseline comparison.")
 
 
 if __name__ == "__main__":
