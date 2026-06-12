@@ -51,11 +51,11 @@ from kaamba.utils.dataloader_config_builder import (
     InterleavedLoader,
 )
 from kaamba.utils.loss_functions import gmm_nll
-from kaamba.utils.memory_monitor import MemoryMonitor, memory_tracker
+from kaamba.utils.memory_monitor import MemoryMonitor
 
 import os
 
-os.environ["NCCL_TIMEOUT"] = "60"
+os.environ["NCCL_TIMEOUT"] = "1800"
 # ---------------------------------------------------------------------------
 # Encoder presets
 # ---------------------------------------------------------------------------
@@ -484,7 +484,8 @@ def train_on_the_fly(
         accelerator.print("=" * 70)
 
         # ── Dataloaders ───────────────────────────────────────────────────
-        builder = DataloaderConfigBuilder(
+
+        builder_kwargs = dict(
             datasets=datasets,
             root=root,
             context_len=context_len,
@@ -492,21 +493,48 @@ def train_on_the_fly(
             sampling_step=sampling_step,
             max_image_size=max_image_size,
         )
-        with memory_tracker("DataLoader creation"):
+        loader_kwargs = dict(
+            split_strategy=split_strategy,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+            test_ratio=test_ratio,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            exclude_participants=exclude_participants,
+            exclude_stimuli=exclude_stimuli,
+            exclude_trials=exclude_trials,
+        )
+        _cache_ready_flag = Path("/tmp") / f"cache_ready_{config.run_id}.flag"
+
+        if accelerator.is_main_process:
+            accelerator.print("Building dataloaders (main process)...")
+            builder = DataloaderConfigBuilder(**builder_kwargs)
             train_loader, val_loader, test_loader, loader_configs = (
-                builder.create_loaders(
-                    split_strategy=split_strategy,
-                    train_ratio=train_ratio,
-                    val_ratio=val_ratio,
-                    test_ratio=test_ratio,
-                    batch_size=batch_size,
-                    num_workers=num_workers,
-                    exclude_participants=exclude_participants,
-                    exclude_stimuli=exclude_stimuli,
-                    exclude_trials=exclude_trials,
-                )
+                builder.create_loaders(**loader_kwargs)
             )
-        tracker.save_loader_configs(loader_configs)
+            tracker.save_loader_configs(loader_configs)
+            accelerator.print("Dataloaders built, waiting for other processes...")
+            _cache_ready_flag.touch()
+        else:
+            # poll until main process signals cache is ready
+            accelerator.print(
+                f"[rank {accelerator.process_index}] waiting for cache..."
+            )
+            while not _cache_ready_flag.exists():
+                time.sleep(5)
+            accelerator.print(
+                f"[rank {accelerator.process_index}] cache ready, loading..."
+            )
+            builder = DataloaderConfigBuilder(**builder_kwargs)
+            train_loader, val_loader, test_loader, _ = builder.create_loaders(
+                **loader_kwargs
+            )
+
+        # NOW it's safe to barrier — all processes have their loaders
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            _cache_ready_flag.unlink(missing_ok=True)
+
         # ── Model ─────────────────────────────────────────────────────────
         model = build_gaze_predictor(**model_config)
 
@@ -545,101 +573,118 @@ def train_on_the_fly(
 
         # ── Epoch loop ────────────────────────────────────────────────────
         final_epoch = start_epoch
-        for epoch in range(start_epoch, num_epochs):
-            final_epoch = epoch
-            epoch_start = time.time()
-            total_loss, nb = 0.0, 0
+        try:
+            for epoch in range(start_epoch, num_epochs):
+                final_epoch = epoch
+                epoch_start = time.time()
+                total_loss, nb = 0.0, 0
 
-            for batch_idx, batch in enumerate(
-                tqdm(
-                    train_loader,
-                    desc=f"Epoch {epoch + 1}",
-                    disable=not accelerator.is_main_process,
-                )
-            ):
-                images = batch["image"].to(accelerator.device)
-                inputs = batch["input_seq"].to(accelerator.device)
-                targets = batch["target_seq"].to(accelerator.device).permute(0, 2, 1)
-                try:
-                    optimizer.zero_grad()
-                    pi, mu, log_sx, log_sy, rho_raw = model(images, inputs)
-                    loss = gmm_nll(pi, mu, log_sx, log_sy, rho_raw, targets)
+                for batch_idx, batch in enumerate(
+                    tqdm(
+                        train_loader,
+                        desc=f"Epoch {epoch + 1}",
+                        disable=not accelerator.is_main_process,
+                    )
+                ):
+                    images = batch["image"].to(accelerator.device)
+                    inputs = batch["input_seq"].to(accelerator.device)
+                    targets = (
+                        batch["target_seq"].to(accelerator.device).permute(0, 2, 1)
+                    )
+                    try:
+                        optimizer.zero_grad()
+                        pi, mu, log_sx, log_sy, rho_raw = model(images, inputs)
+                        loss = gmm_nll(pi, mu, log_sx, log_sy, rho_raw, targets)
 
-                    if batch_idx == 0 and accelerator.is_main_process:
-                        accelerator.print(
-                            f"  [dbg] mu {mu.min():.3f}/{mu.mean():.3f}/{mu.max():.3f}"
-                            f"  log_sx {log_sx.mean():.3f}  rho {rho_raw.max():.3f}"
-                            f"  target {targets.min():.3f}/{targets.max():.3f}"
-                            f"  loss {loss.item():.4f}"
+                        if batch_idx == 0 and accelerator.is_main_process:
+                            accelerator.print(
+                                f"  [dbg] mu {mu.min():.3f}/{mu.mean():.3f}/{mu.max():.3f}"
+                                f"  log_sx {log_sx.mean():.3f}  rho {rho_raw.max():.3f}"
+                                f"  target {targets.min():.3f}/{targets.max():.3f}"
+                                f"  loss {loss.item():.4f}"
+                            )
+
+                        accelerator.backward(loss)
+                        accelerator.clip_grad_norm_(
+                            model.parameters(), max_norm=grad_clip
                         )
+                        optimizer.step()
+                    except torch.cuda.OutOfMemoryError:
+                        # Synchronize both ranks before raising — prevents NCCL desync
+                        if torch.distributed.is_initialized():
+                            torch.distributed.barrier()
+                        raise
 
-                    accelerator.backward(loss)
-                    accelerator.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-                    optimizer.step()
-                except torch.cuda.OutOfMemoryError:
-                    # Synchronize both ranks before raising — prevents NCCL desync
-                    if torch.distributed.is_initialized():
-                        torch.distributed.barrier()
+                    total_loss += loss.item()
+                    nb += 1
+
+                    if (batch_idx + 1) % 50 == 0 and accelerator.is_main_process:
+                        monitor.log_memory(batch_idx + 1, phase="training")
+
+                avg_train = total_loss / nb if nb else 0.0
+                avg_val = validate(model, val_loader, accelerator)
+                epoch_t = time.time() - epoch_start
+                scheduler.step()
+
+                accelerator.print(
+                    f"Epoch {epoch + 1:3d} | train {avg_train:.4f} | val {avg_val:.4f}"
+                    f" | lr {scheduler.get_last_lr()[0]:.2e} | {epoch_t:.1f}s"
+                )
+
+                # ── Log metrics (may raise TrialPruned) ───────────────────────
+                try:
+                    tracker.log_epoch(
+                        epoch=epoch + 1,
+                        val_loss=avg_val,
+                        train_loss=avg_train,
+                        lr=scheduler.get_last_lr()[0],
+                        epoch_time_s=epoch_t,
+                    )
+                except optuna.TrialPruned:
+                    accelerator.print(f"[optuna] pruned at epoch {epoch + 1}")
+                    tracker.finish()
                     raise
 
-                total_loss += loss.item()
-                nb += 1
-
-                if (batch_idx + 1) % 50 == 0 and accelerator.is_main_process:
-                    monitor.log_memory(batch_idx + 1, phase="training")
-
-            avg_train = total_loss / nb if nb else 0.0
-            avg_val = validate(model, val_loader, accelerator)
-            epoch_t = time.time() - epoch_start
-            scheduler.step()
-
-            accelerator.print(
-                f"Epoch {epoch + 1:3d} | train {avg_train:.4f} | val {avg_val:.4f}"
-                f" | lr {scheduler.get_last_lr()[0]:.2e} | {epoch_t:.1f}s"
-            )
-
-            # ── Log metrics (may raise TrialPruned) ───────────────────────
-            try:
-                tracker.log_epoch(
+                # ── Checkpoint ────────────────────────────────────────────────
+                accelerator.wait_for_everyone()
+                tracker.save_checkpoint(
+                    accelerator.unwrap_model(model),
+                    optimizer,
+                    scheduler,
                     epoch=epoch + 1,
                     val_loss=avg_val,
-                    train_loss=avg_train,
-                    lr=scheduler.get_last_lr()[0],
-                    epoch_time_s=epoch_t,
+                    save_every_epoch=save_every_epoch,
                 )
-            except optuna.TrialPruned:
-                accelerator.print(f"[optuna] pruned at epoch {epoch + 1}")
-                tracker.finish()
-                raise
 
-            # ── Checkpoint ────────────────────────────────────────────────
-            accelerator.wait_for_everyone()
-            tracker.save_checkpoint(
-                accelerator.unwrap_model(model),
-                optimizer,
-                scheduler,
-                epoch=epoch + 1,
-                val_loss=avg_val,
-                save_every_epoch=save_every_epoch,
-            )
+                # ── Early stopping ────────────────────────────────────────────
+                should_stop = False
+                for fn, args in [
+                    (training_monitor.check_loss_validity, (avg_val,)),
+                    (training_monitor.check_gradient_norm, (model,)),
+                    (training_monitor.check_epoch_loss, (avg_val,)),
+                ]:
+                    flag, msg = fn(*args)
+                    if msg:
+                        accelerator.print(f"  {msg}")
+                    if flag:
+                        should_stop = True
+                        break
 
-            # ── Early stopping ────────────────────────────────────────────
-            should_stop = False
-            for fn, args in [
-                (training_monitor.check_loss_validity, (avg_val,)),
-                (training_monitor.check_gradient_norm, (model,)),
-                (training_monitor.check_epoch_loss, (avg_val,)),
-            ]:
-                flag, msg = fn(*args)
-                if msg:
-                    accelerator.print(f"  {msg}")
-                if flag:
-                    should_stop = True
+                if should_stop:
+                    accelerator.print("⚠️  Early stop")
                     break
-
-            if should_stop:
-                accelerator.print("⚠️  Early stop")
-                break
+        except KeyboardInterrupt:  # ← catches Ctrl+C
+            accelerator.print("\n[interrupted] saving checkpoint before exit...")
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                tracker.save_checkpoint(
+                    accelerator.unwrap_model(model),
+                    optimizer,
+                    scheduler,
+                    epoch=final_epoch + 1,
+                    val_loss=float("inf"),
+                )
+            raise  # ← re-raises so outer finally runs
 
         # ── Final test eval ───────────────────────────────────────────────
         if not test_loader:
@@ -799,6 +844,7 @@ def run_hparam_search(
                 accelerator=accelerator,
             )
             return best_val
+
         except torch.cuda.OutOfMemoryError:
             gc.collect()
             torch.cuda.empty_cache()
@@ -1014,6 +1060,21 @@ _DEFAULT_EXCLUDE_TRIALS_SEARCH = ["", "3", "2", "4", "5"]
 
 def main():
     import os
+    import signal
+    import sys
+
+    def _cleanup_handler(sig, frame):
+        print("\n[interrupted] cleaning up...")
+        try:
+            torch.cuda.empty_cache()
+            if torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
+        except Exception:
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _cleanup_handler)
+    signal.signal(signal.SIGTERM, _cleanup_handler)
 
     print(os.environ["CUDA_VISIBLE_DEVICES"])
     p = _build_parser()
@@ -1071,6 +1132,10 @@ def main():
             resume_from=args.resume_from,
             use_wandb=args.use_wandb,
             accelerator=accelerator,
+            train_ratio=0.70,
+            val_ratio=0.15,
+            test_ratio=0.15,
+            stride=args.stride,
             exclude_participants=(
                 args.exclude_participants
                 if args.exclude_participants is not None

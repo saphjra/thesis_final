@@ -23,7 +23,7 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 
-# from mamba_ssm import Mamba2
+from mamba_ssm import Mamba2
 from transformers import ViTModel
 
 
@@ -41,6 +41,7 @@ class ImageEncoderType(str, Enum):
 class ConditioningMode(str, Enum):
     INITIAL_STATE = "initial_state"
     EVERY_STEP = "every_step"
+    NONE = "none"
 
 
 # ---------------------------------------------------------------------------
@@ -298,13 +299,18 @@ class GazePredictor(nn.Module):
         self.d_model = d_model
         self.image_embed_dim = image_embed_dim
 
-        self.image_encoder = build_image_encoder(
-            image_encoder_type,
-            image_embed_dim,
-            freeze_encoder,
-            verbose,
-            **encoder_kwargs,
-        )
+        if self.conditioning_mode != ConditioningMode.NONE:
+            self.image_encoder = build_image_encoder(
+                image_encoder_type,
+                image_embed_dim,
+                freeze_encoder,
+                verbose,
+                **encoder_kwargs,
+            )
+        else:
+            self.image_encoder = None
+            if verbose:
+                print("[GazePredictor] image conditioning disabled (ablation)")
 
         input_dim = 2 + (
             image_embed_dim
@@ -360,6 +366,11 @@ class GazePredictor(nn.Module):
         images: torch.Tensor,
         gaze_seq: torch.Tensor,
     ) -> Tuple:
+        if self.conditioning_mode == ConditioningMode.NONE:
+            x = self.input_proj(gaze_seq.permute(0, 2, 1))  # (B, T, D)
+            x = self._run_layers(x)
+            return self.head(self.norm(x))
+
         image_embed = self.image_encoder(images)  # (B, E)
         x = self._prepare_input(gaze_seq, image_embed)  # (B, T, D)
 
