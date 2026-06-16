@@ -586,8 +586,8 @@ def main():
     parser = argparse.ArgumentParser(description="Generate Kaamba architecture diagram")
     parser.add_argument(
         "--out_dir",
-        default="plots/architecture",
-        help="Output directory (default: plots/architecture)",
+        default="outputs/plots/architecture",
+        help="Output directory (default: outputs/plots/architecture)",
     )
     parser.add_argument(
         "--mode",

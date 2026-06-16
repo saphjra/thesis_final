@@ -5,25 +5,38 @@ Loads a pymovements dataset, iterates over gaze objects per stimulus,
 generates matching synthetic sequences from a *sequence generator*, and
 computes all GazeEvaluator metrics — both per-stimulus and aggregated.
 
-Three built-in generators
-──────────────────────────
-  GMMModelGenerator          load a trained GMM  checkpoint (kaamba.py)
-  CategoricalModelGenerator  load a trained categorical checkpoint
-  SyntheticGenerator         generate step-function synthetic gaze
+Built-in generators
+───────────────────
+  GMMModelGenerator              load a trained GMM checkpoint (kaamba.py)
+  SyntheticGenerator             step-function synthetic gaze baseline
+  TrainingDistributionGenerator  i.i.d. samples from training-data distribution
 
 Usage
 ─────
-  # GMM model
+  # GMM model only
   python evaluate_model.py model \
       --checkpoint /path/best_model.pt --dataset mcfw-gaze --root /data
 
-  # Synthetic baseline
+  # Synthetic baseline only
   python evaluate_model.py synthetic \
-      --dataset mcfw-gaze --root /data --noise 15
+      --dataset mcfw-gaze --root /data
 
-  # Side-by-side comparison (model vs synthetic, or two checkpoints)
+  # Empirical (training-distribution) baseline only
+  python evaluate_model.py empirical \
+      --dataset mcfw-gaze --root /data \
+      --train_stimuli 1 2 3
+
+  # Model + one or both baselines as extra conditions
+  python evaluate_model.py model \
+      --checkpoint /path/best_model.pt \
+      --also_synthetic --also_empirical \
+      --train_stimuli 1 2 3 \
+      --dataset mcfw-gaze --root /data
+
+  # Side-by-side: model vs synthetic vs empirical (shorthand)
   python evaluate_model.py compare \
-      --checkpoint /path/model.pt --also_synthetic \
+      --checkpoint /path/model.pt --baseline both \
+      --train_stimuli 1 2 3 \
       --dataset mcfw-gaze --root /data
 
 Output (each generator writes to its own sub-directory):
@@ -39,7 +52,6 @@ import argparse
 import json
 import sys
 import time
-from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -53,6 +65,11 @@ from tqdm import tqdm
 # Project imports
 # ---------------------------------------------------------------------------
 from kaamba.net.models.kaamba import build_gaze_predictor
+from kaamba.utils.baselines import (
+    SequenceGenerator,
+    SyntheticGenerator,
+    TrainingDistributionGenerator,
+)
 from kaamba.utils.eval_plots import (
     plot_aggregate_metrics,
     plot_best_worst_comparison,
@@ -70,31 +87,8 @@ from kaamba.utils.gaze_preprocessing import GazePreprocessor
 
 
 # ---------------------------------------------------------------------------
-# Sequence generator abstraction
+# Model generators
 # ---------------------------------------------------------------------------
-
-
-class SequenceGenerator(ABC):
-    """
-    Abstract interface for anything that produces ``(N, gen_len, 2)``
-    normalised gaze sequences.  The evaluation loop calls ``generate()``
-    once per stimulus and treats the return value as the "fake" pool.
-    """
-
-    name: str = "unnamed"
-
-    @abstractmethod
-    def generate(
-        self,
-        img_path: Optional[Path],
-        n: int,
-        gen_len: int,
-        seed_len: int,
-        experiment,  # pm.gaze.Experiment — carries screen / sr info
-        device: str = "cpu",
-    ) -> np.ndarray:
-        """Return (N, gen_len, 2) float32 array of normalised gaze in [0,1]."""
-
 
 # ── GMM model (kaamba.py) ────────────────────────────────────────────────────
 
@@ -181,96 +175,6 @@ class GMMModelGenerator(SequenceGenerator):
                 temperature=self.temperature,
                 device=device,
             )  # (N, gen_len, 2)
-
-
-# ── Synthetic step-function baseline ─────────────────────────────────────────
-
-
-class SyntheticGenerator(SequenceGenerator):
-    """
-    Generate synthetic gaze using pm.synthetic.step_function.
-    Screen dimensions and sampling rate are taken from the experiment object
-    passed at generation time (extracted from the real dataset).
-    """
-
-    def __init__(
-        self,
-        fix_dur_mean_ms: float = 250.0,
-        fix_dur_std_ms: float = 80.0,
-        sac_dur_mean_ms: float = 40.0,
-        sac_dur_std_ms: float = 15.0,
-        noise: float = 0.5,
-        values_spread: float = 0.7,
-        start_value: Optional[tuple] = None,
-        values_center: Optional[tuple] = None,
-        seed: int = 42,
-        label: Optional[str] = None,
-    ):
-        self.fix_mean = fix_dur_mean_ms
-        self.fix_std = fix_dur_std_ms
-        self.sac_mean = sac_dur_mean_ms
-        self.sac_std = sac_dur_std_ms
-        self.noise = noise
-        self.spread = values_spread
-        self.start = start_value
-        self.center = values_center
-        self.seed = seed
-        self.name = label or "synthetic"
-
-    def generate(self, img_path, n, gen_len, seed_len, experiment, device=None):
-        screen = experiment.screen
-        sr = float(experiment.sampling_rate)
-        sw = int(screen.width_px)
-        sh = int(screen.height_px)
-
-        cx, cy = self.center or (sw / 2, sh / 2)
-        start = self.start or (sw / 2, sh / 2)
-        half_w = sw / 2 * self.spread
-        half_h = sh / 2 * self.spread
-
-        rng = np.random.default_rng(self.seed)
-        seqs = []
-
-        def _ms2s(ms):
-            return max(1, int(round(ms * sr / 1000)))
-
-        for _ in range(n):
-            steps, values, cursor = [], [], 0
-            while cursor < gen_len:
-                fd = max(
-                    _ms2s(self.fix_mean * 0.3),
-                    int(rng.normal(_ms2s(self.fix_mean), _ms2s(self.fix_std))),
-                )
-                x = float(np.clip(rng.uniform(cx - half_w, cx + half_w), 0, sw))
-                y = float(np.clip(rng.uniform(cy - half_h, cy + half_h), 0, sh))
-                steps.append(cursor)
-                values.append((x, y))
-                cursor += fd
-                if cursor >= gen_len:
-                    break
-                sd = max(1, int(rng.normal(_ms2s(self.sac_mean), _ms2s(self.sac_std))))
-                nx = float(np.clip(rng.uniform(cx - half_w, cx + half_w), 0, sw))
-                ny = float(np.clip(rng.uniform(cy - half_h, cy + half_h), 0, sh))
-                steps.append(cursor)
-                values.append(((x + nx) / 2, (y + ny) / 2))
-                cursor += sd
-
-            pairs = [(s, v) for s, v in zip(steps, values) if s < gen_len]
-            if not pairs:
-                pairs = [(0, (sw / 2, sh / 2))]
-            s_list, v_list = zip(*pairs)
-
-            pos = pm.synthetic.step_function(
-                length=gen_len,
-                steps=list(s_list),
-                values=list(v_list),
-                start_value=start,
-                noise=self.noise,
-            )  # (gen_len, 2) in pixels
-            norm = np.stack([pos[:, 0] / sw, pos[:, 1] / sh], axis=1)
-            seqs.append(norm.astype(np.float32))
-
-        return np.stack(seqs)  # (N, gen_len, 2)
 
 
 # ── Image loading helper ─────────────────────────────────────────────────────
@@ -659,9 +563,21 @@ def run_evaluation(
     dataset_paths = pm.DatasetPaths(root=root)
     dataset = pm.Dataset(dataset_name, path=dataset_paths)
     dataset.scan()
-    dataset.load(subset=subset)
+
     if dataset_name == "GGTG":
+        # split_gaze_data must run before stimulus-based filtering is possible
+        # participant = subset.get("participant", None) if subset else None
+        # dataset.load(subset={"subject_id": participant}) if participant else dataset.load()
+        dataset.load()  # todo adapt to load only certain participants
+
         dataset.split_gaze_data(by="stimulus")
+        if subset and "stimulus" in subset:
+            keep = set(subset["stimulus"])
+            dataset.gaze = [
+                g for g in dataset.gaze if g.metadata.get("stimulus") in keep
+            ]
+    else:
+        dataset.load(subset=subset)
 
     print(f"[eval] Loaded {len(dataset.gaze)} gaze files")
 
@@ -744,17 +660,14 @@ def run_evaluation(
                 )
                 continue
 
-            T_avail = len(norm_arr)
-            if T_avail < seed_len + gen_len:
-                tqdm.write(
-                    f"  [dbg] {stim_name}/{gaze.metadata.get('subject_id')}: "
-                    f"only {T_avail} samples, need {seed_len + gen_len} — skipping"
-                )
-                continue
+            # whole recording per subject — pad to longest later
+            real_norm_seqs.append(norm_arr)
 
-            step = max(1, gen_len // 2)  # 50 % overlap — richer real pool
-            for start in range(0, T_avail - gen_len + 1, step):
-                real_norm_seqs.append(norm_arr[start : start + gen_len])
+            # sliding-window alternative (uncomment to use instead):
+            # step = gen_len  # no overlap
+            # # step = max(1, gen_len // 2)  # 50 % overlap — richer real pool
+            # for start in range(0, len(norm_arr) - gen_len + 1, step):
+            #     real_norm_seqs.append(norm_arr[start : start + gen_len])
 
             all_real_fix.append(fix_df)
             all_real_sac.append(sac_df)
@@ -763,7 +676,15 @@ def run_evaluation(
             print(f"  [skip] {stim_name}: no valid real sequences")
             continue
 
-        real_arr = np.stack(real_norm_seqs)  # (N_r, T, 2)
+        # pad recordings to the longest one with NaN; the classifier in
+        # evaluate_stimulus drops NaN rows via the isfinite() mask
+        max_len = max(len(s) for s in real_norm_seqs)
+        real_arr = np.full((len(real_norm_seqs), max_len, 2), np.nan, dtype=np.float32)
+        for i, s in enumerate(real_norm_seqs):
+            real_arr[i, : len(s)] = s
+
+        # sliding-window alternative (uncomment to use instead):
+        # real_arr = np.stack(real_norm_seqs)  # requires all seqs same length
         real_fix_df = pl.concat(all_real_fix) if all_real_fix else pl.DataFrame()
         real_sac_df = pl.concat(all_real_sac) if all_real_sac else pl.DataFrame()
 
@@ -1000,7 +921,7 @@ def _load_config(path: str) -> dict:
         {
             "dataset":       "mcfw-gaze",
             "root":          "/data",
-            "out_dir":       "eval_results",
+            "out_dir":       "/path/to/eval_results",  # default: <root>/../eval_results
             "checkpoint":    "/logs/runs/trial_0019/checkpoints/best_model.pt",
             "n_generate":    100,
             "gen_len":       256,
@@ -1015,15 +936,21 @@ def _load_config(path: str) -> dict:
 
 
 def _add_common_args(sp) -> None:
-    """Attach dataset / generation / event-detection flags tdataset name (default: mcfw-gaze)")
-    sp.add_argument("--root", required=True,
-                    help="Root directory for pyo a subparser."""
+    """Attach dataset / generation / event-detection flags dataset name (default: mcfw-gaze)")"""
     # Dataset
+
+    sp.add_argument(
+        "--root",
+        default=None,
+        help="Path to root directory, where pymovement data is located (or set via --config)",
+    )
+
     sp.add_argument("--dataset", default="mcfw-gaze", help="pymovements movements data")
     sp.add_argument(
         "--out_dir",
-        default="eval_results",
-        help="Output root (a generator sub-dir is added automatically)",
+        default=None,
+        help="Output root (default: <root>/../eval_results, i.e. sibling of the data folder). "
+        "A generator sub-dir is added automatically.",
     )
     # Subset filters
     sp.add_argument(
@@ -1114,9 +1041,12 @@ def _build_parser() -> tuple:
 Modes
 ─────
   model      Evaluate a trained GMM checkpoint.
-  synthetic  Evaluate the synthetic step-function baseline only.
-  compare    Evaluate a GMM checkpoint with the synthetic baseline as an extra
-             condition (equivalent to: model --also_synthetic).
+             Add --also_synthetic and/or --also_empirical for extra baselines.
+  synthetic  Evaluate the step-function baseline only (no model needed).
+  empirical  Evaluate the training-distribution baseline only (no model needed).
+             Pass --train_stimuli to specify which recordings form the training set.
+  compare    GMM checkpoint + one or both baselines.
+             --baseline synthetic|empirical|both  (default: synthetic)
 
 Config file (--config)
 ──────────────────────
@@ -1137,8 +1067,10 @@ Config file (--config)
   Usage:
     python evaluate_model.py model     --config eval_config.json
     python evaluate_model.py model     --config eval_config.json --also_synthetic
+    python evaluate_model.py model     --config eval_config.json --also_empirical --train_stimuli P01 P02
     python evaluate_model.py synthetic --config eval_config.json
-    python evaluate_model.py compare   --config eval_config.json
+    python evaluate_model.py empirical --config eval_config.json --train_stimuli P01 P02
+    python evaluate_model.py compare   --config eval_config.json --baseline both
 """,
     )
     p.add_argument(
@@ -1166,7 +1098,19 @@ Config file (--config)
     model_p.add_argument(
         "--also_synthetic",
         action="store_true",
-        help="Also run the synthetic baseline as an extra condition",
+        help="Also run the step-function synthetic baseline as an extra condition",
+    )
+    model_p.add_argument(
+        "--also_empirical",
+        action="store_true",
+        help="Also run the training-distribution empirical baseline as an extra condition",
+    )
+    model_p.add_argument(
+        "--train_stimuli",
+        nargs="*",
+        default=None,
+        help="Stimulus IDs constituting the training set (for --also_empirical). "
+        "None → all stimuli.",
     )
     _add_common_args(model_p)
 
@@ -1179,11 +1123,27 @@ Config file (--config)
     )
     _add_common_args(syn_p)
 
+    # ── empirical ──────────────────────────────────────────────────────────
+    emp_p = sub.add_parser(
+        "empirical",
+        help="Training-distribution baseline — samples i.i.d. from the observed "
+        "coordinate distribution of the training subset",
+    )
+    emp_p.add_argument(
+        "--train_stimuli",
+        nargs="*",
+        default=None,
+        help="Stimulus IDs constituting the training set. None → all stimuli.",
+    )
+    emp_p.add_argument(
+        "--label", default=None, help="Override the generator name used in output paths"
+    )
+    _add_common_args(emp_p)
+
     # ── compare ────────────────────────────────────────────────────────────
     cmp_p = sub.add_parser(
         "compare",
-        help="GMM checkpoint + synthetic baseline (shorthand for "
-        "model --also_synthetic)",
+        help="GMM checkpoint + one or both baselines as extra conditions",
     )
     cmp_p.add_argument(
         "--checkpoint", default=None, help="Path to best_model.pt (or set via --config)"
@@ -1194,9 +1154,26 @@ Config file (--config)
         default=0.5,
         help="Sampling temperature (default: 0.5)",
     )
+    cmp_p.add_argument(
+        "--baseline",
+        choices=["synthetic", "empirical", "both"],
+        default="synthetic",
+        help="Which baseline(s) to run alongside the model (default: synthetic)",
+    )
+    cmp_p.add_argument(
+        "--train_stimuli",
+        nargs="*",
+        default=None,
+        help="Stimulus IDs for the empirical baseline training set. None → all stimuli.",
+    )
     _add_common_args(cmp_p)
 
-    return p, {"model": model_p, "synthetic": syn_p, "compare": cmp_p}
+    return p, {
+        "model": model_p,
+        "synthetic": syn_p,
+        "empirical": emp_p,
+        "compare": cmp_p,
+    }
 
 
 def _build_subset(args) -> Optional[Dict]:
@@ -1211,24 +1188,183 @@ def _build_subset(args) -> Optional[Dict]:
 
 
 def test():
-    """Quick smoke-test with the synthetic model generator."""
-    syn = SyntheticGenerator()
+    """Quick smoke-test: synthetic baseline + empirical baseline side-by-side."""
+    from kaamba.utils.baselines import test_baselines
 
-    run_evaluation(
-        generator=syn,
+    GGTG_TRAIN_STIM = [
+        "blackout-neg.difficulty",
+        "blackout-neg.interest",
+        "blackout-neg.naturalness",
+        "blackout-neg.question",
+        "blackout-neg.text.0",
+        "blackout-neg.text.1",
+        "blackout-neg.text.2",
+        "blackout-neg.text.3",
+        "blackout-pos.difficulty",
+        "blackout-pos.interest",
+        "blackout-pos.naturalness",
+        "blackout-pos.question",
+        "blackout-pos.text.0",
+        "blackout-pos.text.1",
+        "blackout-pos.text.2",
+        "blackout-pos.text.3",
+        "blackout-pos.text.4",
+        "blackout-zero.difficulty",
+        "blackout-zero.interest",
+        "blackout-zero.naturalness",
+        "blackout-zero.question",
+        "blackout-zero.text.0",
+        "blackout-zero.text.1",
+        "blackout-zero.text.2",
+        "blackout-zero.text.3",
+        "blackout-zero.text.4",
+        "breakfast-neg.difficulty",
+        "breakfast-neg.interest",
+        "breakfast-neg.naturalness",
+        "breakfast-neg.question",
+        "breakfast-neg.text.0",
+        "breakfast-neg.text.1",
+        "breakfast-neg.text.2",
+        "breakfast-neg.text.3",
+        "breakfast-pos.difficulty",
+        "breakfast-pos.interest",
+        "breakfast-pos.naturalness",
+        "breakfast-pos.question",
+        "breakfast-pos.text.0",
+        "breakfast-pos.text.1",
+        "breakfast-pos.text.2",
+        "breakfast-pos.text.3",
+        "breakfast-zero.difficulty",
+        "breakfast-zero.interest",
+        "breakfast-zero.naturalness",
+        "breakfast-zero.question",
+        "breakfast-zero.text.0",
+        "breakfast-zero.text.1",
+        "breakfast-zero.text.2",
+        "breakfast-zero.text.3",
+        "delayed-neg.difficulty",
+        "delayed-neg.interest",
+        "delayed-neg.naturalness",
+        "delayed-neg.question",
+        "delayed-neg.text.0",
+        "delayed-neg.text.1",
+        "delayed-neg.text.2",
+        "delayed-neg.text.3",
+        "delayed-neg.text.4",
+        "delayed-pos.difficulty",
+        "delayed-pos.interest",
+        "delayed-pos.naturalness",
+        "delayed-pos.question",
+        "delayed-pos.text.0",
+        "delayed-pos.text.1",
+        "delayed-pos.text.2",
+        "delayed-pos.text.3",
+        "delayed-zero.difficulty",
+        "delayed-zero.interest",
+        "delayed-zero.naturalness",
+        "delayed-zero.question",
+        "delayed-zero.text.0",
+        "delayed-zero.text.1",
+        "delayed-zero.text.2",
+        "delayed-zero.text.3",
+        "delayed-zero.text.4",
+        "goldfish-neg.difficulty",
+        "goldfish-neg.interest",
+        "goldfish-neg.naturalness",
+        "goldfish-neg.question",
+        "goldfish-neg.text.0",
+        "goldfish-neg.text.1",
+        "goldfish-neg.text.2",
+        "goldfish-neg.text.3",
+        "goldfish-pos.difficulty",
+        "goldfish-pos.interest",
+        "goldfish-pos.naturalness",
+        "goldfish-pos.question",
+        "goldfish-pos.text.0",
+        "goldfish-pos.text.1",
+        "goldfish-pos.text.2",
+        "goldfish-pos.text.3",
+        "goldfish-pos.text.4",
+        "goldfish-zero.difficulty",
+        "goldfish-zero.interest",
+        "goldfish-zero.naturalness",
+        "goldfish-zero.question",
+        "goldfish-zero.text.0",
+        "goldfish-zero.text.1",
+        "goldfish-zero.text.2",
+        "goldfish-zero.text.3",
+        "goldfish-zero.text.4",
+        "practice.difficulty",
+        "practice.interest",
+        "practice.naturalness",
+        "practice.question",
+        "practice.text.0",
+        "practice.text.1",
+        "prize-neg.difficulty",
+        "prize-neg.interest",
+    ]
+    GGTG_EVAL_STIM = [
+        "prize-zero.text.4",
+        "voicemail-neg.difficulty",
+        "voicemail-neg.interest",
+        "voicemail-neg.naturalness",
+        "voicemail-neg.question",
+        "voicemail-neg.text.0",
+        "voicemail-neg.text.1",
+        "voicemail-neg.text.2",
+        "voicemail-neg.text.3",
+        "voicemail-pos.difficulty",
+        "voicemail-pos.interest",
+        "voicemail-pos.naturalness",
+        "voicemail-pos.question",
+        "voicemail-pos.text.0",
+        "voicemail-pos.text.1",
+        "voicemail-pos.text.2",
+        "voicemail-pos.text.3",
+        "voicemail-zero.difficulty",
+        "voicemail-zero.interest",
+        "voicemail-zero.naturalness",
+        "voicemail-zero.question",
+        "voicemail-zero.text.0",
+        "voicemail-zero.text.1",
+        "voicemail-zero.text.2",
+        "voicemail-zero.text.3",
+    ]
+
+    # Run the lightweight baseline unit test first
+    test_baselines(
         dataset_name="GGTG",
-        root=r"C:\Users\saphi\PycharmProjects\thesis\data",
-        out_dir=r"C:\Users\saphi\PycharmProjects\thesis\eval_results",
-        subset={"subject_id": ["P01"]},
+        root=r"/home/janhof/thesis/data",
+        train_subset={"stimulus": GGTG_TRAIN_STIM},
+        eval_subset={"stimulus": GGTG_EVAL_STIM},
+        n_generate=5,
+        gen_len=2000,
+    )
+
+    # Full evaluation with both baselines
+    _ROOT = r"/home/janhof/thesis/data"
+    _COMMON = dict(
+        dataset_name="GGTG",
+        root=_ROOT,
+        out_dir=str(Path(_ROOT).parent / "eval_results"),
+        subset={"stimulus": GGTG_EVAL_STIM},
         n_generate=20,
         seed_len=32,
-        gen_len=2000,  # for each subject's recording of  stimulus, extracts normalized (x,y) gaze coordinates as sliding windows of length gen_len.
+        gen_len=2000,
         dispersion_threshold=1.0,
         min_fix_duration=98,
         min_sac_duration=18,
         vel_method="fivepoint",
         device="cuda" if torch.cuda.is_available() else "cpu",
     )
+
+    syn = SyntheticGenerator()
+    emp = TrainingDistributionGenerator(
+        dataset_name="GGTG",
+        root=_ROOT,
+        train_subset={"stimulus": GGTG_TRAIN_STIM},
+    )
+    run_multi_evaluation(generators=[syn, emp], **_COMMON)
 
 
 def main():
@@ -1251,7 +1387,8 @@ def main():
         # Apply config defaults only to the active subparser so that keys
         # that don't exist on a given subparser are silently ignored.
         mode_from_argv = next(
-            (a for a in _argv if a in {"model", "synthetic", "compare"}), None
+            (a for a in _argv if a in {"model", "synthetic", "empirical", "compare"}),
+            None,
         )
         targets = (
             [subparsers[mode_from_argv]]
@@ -1278,10 +1415,12 @@ def main():
 
     subset = _build_subset(args)
 
+    out_dir = args.out_dir or str(Path(args.root).parent / "eval_results")
+
     common = dict(
         dataset_name=args.dataset,
         root=args.root,
-        out_dir=args.out_dir,
+        out_dir=out_dir,
         subset=subset,
         n_generate=args.n_generate,
         seed_len=args.seed_len,
@@ -1296,21 +1435,45 @@ def main():
         scanpath_overview=args.scanpath_overview,
     )
 
+    def _make_empirical(label=None):
+        train_stimuli = getattr(args, "train_stimuli", None)
+        train_subset = {"stimulus": train_stimuli} if train_stimuli else None
+        return TrainingDistributionGenerator(
+            dataset_name=args.dataset,
+            root=args.root,
+            train_subset=train_subset,
+            label=label,
+        )
+
     if args.mode == "model":
         gen = GMMModelGenerator(
             args.checkpoint, args.temperature, args.device, args.label
         )
-        extras = [SyntheticGenerator()] if args.also_synthetic else None
-        run_evaluation(gen, extra_generators=extras, **common)
+        extras: List[SequenceGenerator] = []
+        if args.also_synthetic:
+            extras.append(SyntheticGenerator())
+        if args.also_empirical:
+            extras.append(_make_empirical())
+        run_evaluation(gen, extra_generators=extras or None, **common)
 
     elif args.mode == "synthetic":
         gen = SyntheticGenerator(label=getattr(args, "label", None))
         run_evaluation(gen, **common)
 
+    elif args.mode == "empirical":
+        gen = _make_empirical(label=getattr(args, "label", None))
+        run_evaluation(gen, **common)
+
     elif args.mode == "compare":
         gen = GMMModelGenerator(args.checkpoint, args.temperature, args.device)
-        run_evaluation(gen, extra_generators=[SyntheticGenerator()], **common)
+        baseline = getattr(args, "baseline", "synthetic")
+        extras = []
+        if baseline in ("synthetic", "both"):
+            extras.append(SyntheticGenerator())
+        if baseline in ("empirical", "both"):
+            extras.append(_make_empirical())
+        run_evaluation(gen, extra_generators=extras, **common)
 
 
 if __name__ == "__main__":
-    test()
+    main()

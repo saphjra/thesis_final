@@ -178,7 +178,11 @@ def build_conditions_data(
         result[cname] = {
             "fix_df": pl.concat(data["fix_dfs"]) if data["fix_dfs"] else pl.DataFrame(),
             "sac_df": pl.concat(data["sac_dfs"]) if data["sac_dfs"] else pl.DataFrame(),
-            "seqs": np.concatenate(data["seqs"])
+            "seqs": np.concatenate(
+                # truncate each stimulus block to its shortest time axis so
+                # arrays with different padding lengths can be concatenated
+                [s[:, : min(a.shape[1] for a in data["seqs"]), :] for s in data["seqs"]]
+            )
             if data["seqs"]
             else np.zeros((0, 1, 2)),
         }

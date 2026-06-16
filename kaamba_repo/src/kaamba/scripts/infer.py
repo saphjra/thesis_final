@@ -39,7 +39,7 @@ Config file (--config)
           "start_x":     0.5,
           "start_y":     0.1,
           "device":      "cuda",
-          "out_dir":     "infer_results"
+          "out_dir":     "outputs/infer_results"
       }
 
 Output files (all written to --out_dir / <model-name>/)
@@ -648,7 +648,7 @@ Config file (--config):
         "n":           10,
         "gen_len":     256,
         "temperature": 0.9,
-        "out_dir":     "infer_results"
+        "out_dir":     "outputs/infer_results"
     }
 
   Usage:
@@ -760,8 +760,8 @@ Config file (--config):
     # ── Output ────────────────────────────────────────────────────────────
     p.add_argument(
         "--out_dir",
-        default="logs/infer_results",
-        help="Output root directory  (default: logs/infer_results/)",
+        default="outputs/infer_results",
+        help="Output root directory  (default: outputs/infer_results/)",
     )
     p.add_argument(
         "--label",

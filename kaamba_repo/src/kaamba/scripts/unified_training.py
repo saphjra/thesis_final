@@ -119,7 +119,7 @@ class ExperimentConfig:
     trial_number: Optional[int] = None
     study_name: Optional[str] = None
 
-    log_dir: str = "logs/runs"
+    log_dir: str = "outputs/logs/runs"
     resume_from: Optional[str] = None
 
     def to_dict(self) -> dict:
@@ -422,7 +422,7 @@ def train_on_the_fly(
     exclude_stimuli: Optional[List] = None,
     exclude_trials: Optional[List] = None,
     # Tracking
-    log_dir: str = "logs/runs",
+    log_dir: str = "outputs/logs/runs",
     run_name: Optional[str] = None,
     resume_from: Optional[str] = None,
     use_wandb: bool = False,
@@ -762,7 +762,7 @@ def run_hparam_search(
     max_batches_per_epoch: Optional[int] = 200,
     # Study persistence
     study_name: str = "gaze_mamba_search",
-    log_dir: str = "logs/runs",
+    log_dir: str = "outputs/logs/runs",
     storage: Optional[str] = None,  # e.g. "sqlite:///study.db"
     use_wandb: bool = False,
 ):
@@ -975,7 +975,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # ── shared data args ──────────────────────────────────────────────────
     p.add_argument("--datasets", nargs="+", default=["mcfw-gaze"])
     p.add_argument("--root", default="/home/janhof/thesis/data/")
-    p.add_argument("--log_dir", default="/home/janhof/thesis/logs/runs")
+    p.add_argument("--log_dir", default="outputs/logs/runs")
     p.add_argument("--context_len", type=int, default=200)
     p.add_argument("--sampling_step", type=int, default=1)
     p.add_argument("--max_image_size", type=int, default=224)

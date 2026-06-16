@@ -730,7 +730,7 @@ def _parse():
     )
     p.add_argument(
         "--out_dir",
-        default=r"C:\Users\saphi\PycharmProjects/thesis/logs/dataset_stats",
+        default="outputs/dataset_stats",
         help="Output directory",
     )
     p.add_argument(

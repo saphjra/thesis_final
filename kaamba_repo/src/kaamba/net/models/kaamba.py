@@ -23,7 +23,7 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 
-from mamba_ssm import Mamba2
+# from mamba_ssm import Mamba2
 from transformers import ViTModel
 
 
@@ -342,7 +342,7 @@ class GazePredictor(nn.Module):
                 f"[GazePredictor] encoder={image_encoder_type} mode={conditioning_mode} "
                 f"d_model={d_model} layers={n_layers} K={n_mix}"
             )
-            print(f"[GazePredictor] {total:,} total params, {trainable:,} trainable")
+            print(f"[GzePredictor] {total:,} total params, {trainable:,} trainable")
 
     def _run_layers(self, x: torch.Tensor) -> torch.Tensor:
         for layer in self.layers:
