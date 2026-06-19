@@ -24,28 +24,25 @@ class GazePreprocessor:
 
     def __init__(
         self,
-        vel_threshold: float = 30.0,
+        threshold_factor: float = 6.0,  # ← the real sensitivity parameter (was: vel_threshold)
         dispersion_threshold: float = 1.0,
         min_fix_duration: int = 100,
         min_sac_duration: int = 30,
         vel_method: str = "fivepoint",
+        vel_threshold: float = 30.0,
     ):
-        self.vel_threshold = vel_threshold
+        self.threshold_factor = threshold_factor
         self.dispersion_threshold = dispersion_threshold
         self.min_fix_duration = min_fix_duration
         self.min_sac_duration = min_sac_duration
         self.vel_method = vel_method
+        self.vel_threshold = vel_threshold
 
     # ------------------------------------------------------------------
     # Dataset-level (all recordings at once)
     # ------------------------------------------------------------------
 
     def apply_dataset(self, dataset: pm.Dataset, dataset_name: str) -> None:
-        """
-        Preprocess all recordings in *dataset* in-place.
-
-        Applies dataset-specific fixes first, then runs the shared pipeline.
-        """
         min_fix = self.min_fix_duration
         min_sac = self.min_sac_duration
 
@@ -59,11 +56,33 @@ class GazePreprocessor:
             minimum_duration=min_fix,
             dispersion_threshold=self.dispersion_threshold,
         )
-        dataset.detect_events(
-            "microsaccades",
-            threshold=self.vel_threshold,
-            minimum_duration=min_sac,
-        )
+
+        # Per-recording try/except — a single zero-variance recording
+        # (e.g. a frozen/corrupted segment) should not abort the whole dataset.
+        failed = []
+        for gaze in dataset.gaze:
+            try:
+                gaze.detect(
+                    "microsaccades",
+                    clear=False,
+                    threshold_factor=self.threshold_factor,
+                    minimum_duration=min_sac,
+                )
+            except ValueError as e:
+                failed.append(
+                    (
+                        gaze.metadata.get("subject_id"),
+                        gaze.metadata.get("stimulus"),
+                        str(e),
+                    )
+                )
+
+        if failed:
+            print(
+                f"[preprocess] microsaccade detection failed for {len(failed)} recordings "
+                f"(likely zero-variance/corrupted segments): {failed[:3]}{'...' if len(failed) > 3 else ''}"
+            )
+
         dataset.compute_event_properties(["amplitude", "dispersion", "peak_velocity"])
 
     # ------------------------------------------------------------------
@@ -92,6 +111,7 @@ class GazePreprocessor:
         gaze.detect(
             "microsaccades",
             minimum_duration=self.min_sac_duration,
+            threshold_factor=self.threshold_factor,
         )
 
         n_saccades = (
@@ -99,8 +119,8 @@ class GazePreprocessor:
             if gaze.events is not None and gaze.events.frame is not None
             else 0
         )
-        if n_saccades == 0:
-            self._fill_saccades(gaze)
+        # if n_saccades == 0:
+        #     self._fill_saccades(gaze)
 
         gaze.compute_event_properties(["amplitude", "dispersion", "peak_velocity"])
 

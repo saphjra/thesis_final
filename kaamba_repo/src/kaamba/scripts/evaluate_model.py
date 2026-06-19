@@ -64,7 +64,8 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 # Project imports
 # ---------------------------------------------------------------------------
-from kaamba.net.models.kaamba import build_gaze_predictor
+# NOTE: build_gaze_predictor is imported lazily inside GMMModelGenerator.__init__
+# to avoid loading mamba_ssm/triton (which require a CUDA driver) in non-model modes.
 from kaamba.utils.baselines import (
     SequenceGenerator,
     SyntheticGenerator,
@@ -103,6 +104,10 @@ class GMMModelGenerator(SequenceGenerator):
         device: str = "cpu",
         label: Optional[str] = None,
     ):
+        from kaamba.net.models.kaamba import (
+            build_gaze_predictor,
+        )  # lazy: needs CUDA/triton
+
         self.device = device
         self.temperature = temperature
         ckpt = torch.load(checkpoint_path, map_location=device)
@@ -529,6 +534,7 @@ def run_evaluation(
     extra_generators: Optional[List[SequenceGenerator]] = None,
     per_stimulus_plots: bool = False,
     scanpath_overview: bool = False,
+    rng_seed: int = 42,
 ) -> Dict:
     """
     Main evaluation loop.
@@ -553,6 +559,9 @@ def run_evaluation(
             extra.name:      {"seqs", "fix_df", "sac_df"},   # one per extra_generator
         }}
     """
+    np.random.seed(rng_seed)
+    torch.manual_seed(rng_seed)
+
     out_dir = Path(out_dir) / generator.name
     stim_dir = out_dir / "per_stimulus"
     stim_dir.mkdir(parents=True, exist_ok=True)
@@ -630,6 +639,9 @@ def run_evaluation(
 
     # ── Per-stimulus loop ─────────────────────────────────────────────────
     all_results = {}
+    extra_all_results: Dict[str, Dict] = {
+        eg.name: {} for eg in (extra_generators or [])
+    }
     _plot_cache = {}  # stores raw arrays for post-hoc plotting
     timing_total = 0.0
 
@@ -807,6 +819,16 @@ def run_evaluation(
                     "fix_df": extra_fix_df,
                     "sac_df": extra_sac_df,
                 }
+                ex_metrics = evaluate_stimulus(
+                    real_seqs=real_arr,
+                    fake_seqs=extra_norm,
+                    real_fix_df=real_fix_df,
+                    real_sac_df=real_sac_df,
+                    fake_fix_df=extra_fix_df,
+                    fake_sac_df=extra_sac_df,
+                )
+                ex_metrics["stimulus"] = stim_name
+                extra_all_results[extra_gen.name][stim_name] = ex_metrics
             except Exception as e:
                 tqdm.write(
                     f"  [warn] extra generator '{extra_gen.name}' failed for {stim_name}: {e}"
@@ -850,6 +872,17 @@ def run_evaluation(
     report_path.write_text(report)
     print(report)
     print(f"\n[eval] Results saved to {out_dir}")
+
+    # ── Comparison table (primary + all extra generators) ─────────────────
+    if extra_generators:
+        combined = {generator.name: all_results}
+        for eg in extra_generators:
+            if extra_all_results.get(eg.name):
+                combined[eg.name] = extra_all_results[eg.name]
+        baseline_names = "_vs_".join(eg.name for eg in extra_generators)
+        comparison_path = out_dir / f"comparison_vs_{baseline_names}.txt"
+        save_comparison_table(combined, comparison_path)
+        print(f"[eval] Comparison table → {comparison_path}")
 
     # ── Aggregate metric plots (always generated) ─────────────────────────
     plot_aggregate_metrics(
@@ -908,7 +941,10 @@ def run_multi_evaluation(
         results = run_evaluation(gen, dataset_name, root, out_dir, **kwargs)
         all_gen_results[gen.name] = results
 
-    save_comparison_table(all_gen_results, Path(out_dir) / "comparison.txt")
+    gen_names = "_vs_".join(g.name for g in generators)
+    comparison_path = Path(out_dir) / f"comparison_{gen_names}.txt"
+    save_comparison_table(all_gen_results, comparison_path)
+    print(f"[eval] Comparison table → {comparison_path}")
     return all_gen_results
 
 
@@ -1029,6 +1065,12 @@ def _add_common_args(sp) -> None:
         "--scanpath_overview",
         default=True,
         help="Also generate the tiled scanpath overview figure",
+    )
+    sp.add_argument(
+        "--rng_seed",
+        type=int,
+        default=42,
+        help="Global RNG seed for reproducible generation (default: 42)",
     )
 
 
@@ -1433,6 +1475,7 @@ def main():
         device=args.device,
         per_stimulus_plots=args.per_stimulus_plots,
         scanpath_overview=args.scanpath_overview,
+        rng_seed=args.rng_seed,
     )
 
     def _make_empirical(label=None):
