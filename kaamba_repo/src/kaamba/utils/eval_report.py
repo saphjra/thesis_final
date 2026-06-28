@@ -2,10 +2,22 @@
 eval_report.py
 
 Aggregation and report helpers for evaluate_model.py.
+
+Can also be run as a standalone script to regenerate reports from saved
+per-stimulus JSON files::
+
+    python eval_report.py /path/to/per_stimulus/ [--out_dir /path/to/out]
+
+The directory is expected to contain ``<stimulus>.json`` files as written by
+``evaluate_model.py``.  Reports are written next to the ``per_stimulus/``
+folder (or to ``--out_dir`` if provided).
 """
 
 from __future__ import annotations
 
+import argparse
+import json
+import math
 from pathlib import Path
 from typing import Dict
 
@@ -83,6 +95,8 @@ def build_eval_report(all_results: Dict, aggregate: Dict, total_time: float) -> 
         f"{_agg(aggregate, 'saccade_amplitude', 'fake_mean_deg'):>12}",
         f"  {'KS statistic':42} {_agg(aggregate, 'saccade_amplitude', 'ks_stat'):>12}",
         f"  {'KS p-value':42} {_agg(aggregate, 'saccade_amplitude', 'p_value'):>12}",
+        f"  {'N saccades — real':42} {_agg(aggregate, 'saccade_amplitude', 'n_real'):>12}",
+        f"  {'N saccades — fake':42} {_agg(aggregate, 'saccade_amplitude', 'n_fake'):>12}",
     ]
 
     # ── Main sequence ─────────────────────────────────────────────────────
@@ -124,32 +138,41 @@ def build_eval_report(all_results: Dict, aggregate: Dict, total_time: float) -> 
         f"  {'Classifier AUC':42} {_agg(aggregate, 'classifier_auc', 'auc'):>12}",
     ]
 
-    # ── Per-stimulus summary ──────────────────────────────────────────────
+    # ── Per-stimulus summary table ────────────────────────────────────────
     lines += [
         "",
         "PER-STIMULUS SUMMARY",
         "-" * W,
-        f"  {'Stimulus':<40} {'fix_mean_r':>10} {'fix_mean_f':>10} "
-        f"{'sac_amp_r':>9} {'sac_amp_f':>9} {'fix_KS':>7} {'sac_KS':>7} {'AUC':>7}",
+        f"  {'Stimulus':<40} {'fix_KS':>6} {'fix_r':>8} {'fix_f':>8}"
+        f" {'sac_KS':>6} {'sac_r':>7} {'sac_f':>7}"
+        f" {'ms_r':>6} {'ms_f':>6}"
+        f" {'ISI_err':>7} {'fix_KL':>7} {'dir_KL':>7} {'AUC':>7}",
     ]
 
-    def _v(m, section, key):
+    def _v(m, section, key, fmt=".3f"):
         try:
             val = m[section][key]
-            return f"{val:.3f}" if not np.isnan(val) else "  nan"
+            if val is None or (isinstance(val, float) and math.isnan(val)):
+                return "nan"
+            return format(val, fmt)
         except (KeyError, TypeError):
-            return "  n/a"
+            return "n/a"
 
     for stim, m in sorted(all_results.items()):
         lines.append(
             f"  {stim:<40}"
-            f" {_v(m, 'fixation_duration', 'real_mean'):>10}"
-            f" {_v(m, 'fixation_duration', 'fake_mean'):>10}"
-            f" {_v(m, 'saccade_amplitude', 'real_mean_deg'):>9}"
-            f" {_v(m, 'saccade_amplitude', 'fake_mean_deg'):>9}"
-            f" {_v(m, 'fixation_duration', 'ks_stat'):>7}"
-            f" {_v(m, 'saccade_amplitude', 'ks_stat'):>7}"
-            f" {_v(m, 'classifier_auc', 'auc'):>7}"
+            f" {_v(m, 'fixation_duration', 'ks_stat'):>6}"
+            f" {_v(m, 'fixation_duration', 'real_mean', '.1f'):>8}"
+            f" {_v(m, 'fixation_duration', 'fake_mean', '.1f'):>8}"
+            f" {_v(m, 'saccade_amplitude', 'ks_stat'):>6}"
+            f" {_v(m, 'saccade_amplitude', 'real_mean_deg', '.2f'):>7}"
+            f" {_v(m, 'saccade_amplitude', 'fake_mean_deg', '.2f'):>7}"
+            f" {_v(m, 'main_sequence', 'real_r', '.3f'):>6}"
+            f" {_v(m, 'main_sequence', 'fake_r', '.3f'):>6}"
+            f" {_v(m, 'intersaccadic_interval', 'mean_err', '.1f'):>7}"
+            f" {_v(m, 'fixation_density_map', 'kl_divergence', '.3f'):>7}"
+            f" {_v(m, 'saccade_direction', 'kl_divergence', '.3f'):>7}"
+            f" {_v(m, 'classifier_auc', 'auc', '.4f'):>7}"
         )
 
     # ── Pass / fail checks ────────────────────────────────────────────────
@@ -262,3 +285,116 @@ def save_comparison_table(all_gen_results: Dict[str, Dict], out_path: Path) -> N
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("\n".join(lines))
     print(f"[compare] table → {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# Standalone CLI — regenerate reports from saved per-stimulus JSONs
+# ---------------------------------------------------------------------------
+
+
+def load_per_stimulus_jsons(per_stimulus_dir: Path) -> Dict:
+    """Load all *.json files from a per_stimulus directory into a results dict."""
+    results = {}
+    for p in sorted(per_stimulus_dir.glob("*.json")):
+        data = json.loads(p.read_text())
+        stim = data.get("stimulus", p.stem)
+        results[stim] = data
+    return results
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Regenerate eval reports from saved per-stimulus JSON files.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples
+────────
+  # Regenerate reports in-place (next to per_stimulus/ folder)
+  python eval_report.py /path/to/eval_results/empirical_GGTG/per_stimulus
+
+  # Write to a different output directory
+  python eval_report.py /path/to/per_stimulus --out_dir /tmp/reports
+
+  # Compare multiple generators side-by-side
+  python eval_report.py /path/to/modelA/per_stimulus /path/to/modelB/per_stimulus
+""",
+    )
+    parser.add_argument(
+        "per_stimulus_dirs",
+        nargs="+",
+        metavar="PER_STIMULUS_DIR",
+        help="One or more per_stimulus/ directories containing *.json files",
+    )
+    parser.add_argument(
+        "--out_dir",
+        default=None,
+        help="Output directory (default: parent of each per_stimulus/ dir)",
+    )
+    args = parser.parse_args()
+
+    dirs = [Path(d) for d in args.per_stimulus_dirs]
+    for d in dirs:
+        if not d.is_dir():
+            parser.error(f"Not a directory: {d}")
+
+    if len(dirs) == 1:
+        # ── Single generator: regenerate aggregate.json + eval_report.txt ──
+        d = dirs[0]
+        out_dir = Path(args.out_dir) if args.out_dir else d.parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        all_results = load_per_stimulus_jsons(d)
+        if not all_results:
+            print(f"[error] No JSON files found in {d}")
+            return
+
+        total_time = sum(
+            m.get("time_s", 0) for m in all_results.values() if isinstance(m, dict)
+        )
+        aggregate = aggregate_results(all_results)
+
+        agg_path = out_dir / "aggregate.json"
+        agg_path.write_text(json.dumps(aggregate, indent=2))
+        print(f"[report] aggregate  → {agg_path}")
+
+        report = build_eval_report(all_results, aggregate, total_time)
+        rpt_path = out_dir / "eval_report.txt"
+        rpt_path.write_text(report)
+        print(f"[report] text report → {rpt_path}")
+        print(report)
+
+    else:
+        # ── Multiple generators: per-generator reports + comparison table ──
+        all_gen_results: Dict[str, Dict] = {}
+        for d in dirs:
+            gen_name = d.parent.name  # name of the generator folder
+            out_dir = Path(args.out_dir) / gen_name if args.out_dir else d.parent
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            all_results = load_per_stimulus_jsons(d)
+            if not all_results:
+                print(f"[warn] No JSON files in {d}, skipping")
+                continue
+
+            total_time = sum(
+                m.get("time_s", 0) for m in all_results.values() if isinstance(m, dict)
+            )
+            aggregate = aggregate_results(all_results)
+
+            agg_path = out_dir / "aggregate.json"
+            agg_path.write_text(json.dumps(aggregate, indent=2))
+
+            report = build_eval_report(all_results, aggregate, total_time)
+            rpt_path = out_dir / "eval_report.txt"
+            rpt_path.write_text(report)
+            print(f"[report] {gen_name} → {rpt_path}")
+
+            all_gen_results[gen_name] = all_results
+
+        if len(all_gen_results) >= 2:
+            cmp_dir = Path(args.out_dir) if args.out_dir else dirs[0].parent.parent
+            save_comparison_table(all_gen_results, cmp_dir / "comparison.txt")
+
+
+if __name__ == "__main__":
+    main()

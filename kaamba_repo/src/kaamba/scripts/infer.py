@@ -39,7 +39,7 @@ Config file (--config)
           "start_x":     0.5,
           "start_y":     0.1,
           "device":      "cuda",
-          "out_dir":     "outputs/infer_results"
+          "out_dir":     "infer_results"
       }
 
 Output files (all written to --out_dir / <model-name>/)
@@ -93,8 +93,7 @@ def _load_model(
     run_name = Path(checkpoint_path).parent.parent.name
     print(f"[infer] model type  : {model_type}  ({n_params:,} params)")
     print(f"[infer] run name    : {run_name}")
-    if model_type == "categorical":
-        print(f"[infer] n_bins      : {model_config.get('n_bins', '?')}")
+
     return model, model_type, model_config
 
 
@@ -233,7 +232,7 @@ def _detect_fixations(
     min_fix_dur: int = 50,
 ):
     """
-    Run IVT fixation detection on generated sequences.
+    Run IDT fixation detection on generated sequences.
 
     Returns a list of dicts, one per sequence, each containing:
       ``cx_norm``, ``cy_norm`` (centroid in [0,1]),
@@ -582,11 +581,6 @@ def visualize(
     plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-# Save helpers
-# ---------------------------------------------------------------------------
-
-
 def save_json(seqs: np.ndarray, out_path: Path, meta: dict) -> None:
     """
     Save scanpaths as JSON.
@@ -618,19 +612,9 @@ def save_npy(seqs: np.ndarray, out_path: Path) -> None:
     print(f"[infer] .npy  → {out_path}")
 
 
-# ---------------------------------------------------------------------------
-# Config file
-# ---------------------------------------------------------------------------
-
-
 def _load_config(path: str) -> dict:
     """Load a flat JSON config file whose keys match CLI argument names."""
     return json.loads(Path(path).read_text())
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -648,7 +632,7 @@ Config file (--config):
         "n":           10,
         "gen_len":     256,
         "temperature": 0.9,
-        "out_dir":     "outputs/infer_results"
+        "out_dir":     "infer_results"
     }
 
   Usage:
@@ -678,7 +662,7 @@ Config file (--config):
 
     # ── Generation ────────────────────────────────────────────────────────
     p.add_argument(
-        "--n", type=int, default=2, help="Number of scanpaths to generate  (default: 1)"
+        "--n", type=int, default=1, help="Number of scanpaths to generate  (default: 1)"
     )
     p.add_argument(
         "--gen_len",
@@ -724,12 +708,12 @@ Config file (--config):
     p.add_argument(
         "--show_fixations",
         action="store_true",
-        help="Overlay IVT fixation circles on the scanpath plot",
+        help="Overlay IDT fixation circles on the scanpath plot",
     )
     p.add_argument(
         "--sr",
         type=float,
-        default=500.0,
+        default=1000.0,
         help="Sampling rate in Hz (needed for fixation detection, default: 500)",
     )
     p.add_argument(
@@ -896,7 +880,7 @@ def main():
     if args.save_json:
         save_json(
             seqs,
-            out_dir / "scanpaths.json",
+            out_dir / f"scanpaths_{args.temperature}_{img_path.stem}.json",
             meta={
                 "checkpoint": str(ckpt_path),
                 "image": str(img_path),
@@ -912,7 +896,7 @@ def main():
         )
 
     if args.save_npy:
-        save_npy(seqs, out_dir / "scanpaths.npy")
+        save_npy(seqs, out_dir / f"{args.temperature}_{img_path.stem}.npy")
 
     show = not args.no_show
     if args.save_plot or show:
@@ -928,7 +912,9 @@ def main():
         visualize(
             seqs=seqs,
             image_path=img_path,
-            out_path=out_dir / "scanpaths.png" if args.save_plot else None,
+            out_path=out_dir / f"scanpaths_{args.temperature}_{img_path.stem}.png"
+            if args.save_plot
+            else None,
             show=show,
             title=title,
             layout=args.layout,

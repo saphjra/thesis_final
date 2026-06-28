@@ -24,7 +24,7 @@ class GazePreprocessor:
 
     def __init__(
         self,
-        threshold_factor: float = 6.0,  # ← the real sensitivity parameter (was: vel_threshold)
+        threshold_factor: float = 6.0,
         dispersion_threshold: float = 1.0,
         min_fix_duration: int = 100,
         min_sac_duration: int = 30,
@@ -119,8 +119,8 @@ class GazePreprocessor:
             if gaze.events is not None and gaze.events.frame is not None
             else 0
         )
-        # if n_saccades == 0:
-        #     self._fill_saccades(gaze)
+        if n_saccades == 0:
+            self._fill_saccades(gaze)
 
         gaze.compute_event_properties(["amplitude", "dispersion", "peak_velocity"])
 
