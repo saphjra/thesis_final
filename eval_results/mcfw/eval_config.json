@@ -1,7 +1,7 @@
 {
   "dataset":       "mcfw-gaze",
   "root":          "/home/janhof/thesis/data",
-  "checkpoint":    "/home/janhof/thesis/logs/runs/mcfw-gaze/checkpoints/best_model.pt",
+  "checkpoint":    "/home/janhof/thesis/eval_results/mcfw/checkpoints/best_model.pt",
   "n_generate":    45,
   "gen_len":       600,
   "dispersion_threshold": 1.0,

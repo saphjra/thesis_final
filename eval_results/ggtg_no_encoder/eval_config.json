@@ -1,7 +1,7 @@
 {
   "dataset":       "GGTG",
   "root":          "/home/janhof/thesis/data",
-  "checkpoint":    "/home/janhof/thesis/logs/runs/GGTG_no_encoder/checkpoints/best_model.pt",
+  "checkpoint":    "/home/janhof/thesis/eval_results/ggtg_no_encoder/checkpoints/best_model.pt",
   "n_generate":    8,
   "gen_len":       19200,
   "dispersion_threshold": 1.0,
