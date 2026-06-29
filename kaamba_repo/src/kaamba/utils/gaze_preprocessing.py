@@ -119,8 +119,8 @@ class GazePreprocessor:
             if gaze.events is not None and gaze.events.frame is not None
             else 0
         )
-        # if n_saccades == 0:
-        #     self._fill_saccades(gaze)
+        if n_saccades == 0:
+            self._fill_saccades(gaze)
 
         gaze.compute_event_properties(["amplitude", "dispersion", "peak_velocity"])
 
