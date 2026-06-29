@@ -1,6 +1,6 @@
 # KAAMBA — Thesis Repository
 
-This repository contains the complete codebase and pre-computed results for the thesis project **"Gaze Prediction with Mamba-based Neural Networks"**. It is organised as a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/) with the KAAMBA package as its sole member.
+This repository contains the complete codebase and pre-computed results for the thesis project **"Kaamba: Gaze Prediction with Mamba-based Neural Networks"**. It is organised as a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/) with the KAAMBA package as its sole member.
 
 ---
 
@@ -118,7 +118,7 @@ The raw MCFW-Gaze stimulus images (`data/mcfw-gaze/raw/dataset/stimuli/`) are no
 ```python
 from pathlib import Path
 from PIL import Image
-from kaamba.utils.image_preprocessing import scale_image_to_screen, place_on_screen
+from kaamba_repo.src.kaamba.utils.image_preprocessing import scale_image_to_screen, place_on_screen
 
 raw_dir = Path("data/mcfw-gaze/raw/dataset/stimuli")
 out_dir = Path("data/mcfw-gaze/stimuli/dataset/stimuli")
@@ -143,20 +143,21 @@ The `synthetic` and `empirical` baseline generators do not load the model and re
 
 ```bash
 # GGTG
-python -m kaamba.scripts.evaluate_model --config eval_results/ggtg/eval_config.json synthetic --label synthetic_ggtg
-
+python -m kaamba_repo.src.kaamba.scripts.evaluate_model --config eval_results/ggtg/eval_config.json synthetic --label synthetic_ggtg
+```
+```bash
 # MCFW-Gaze
-python -m kaamba.scripts.evaluate_model --config eval_results/mcfw/eval_config.json synthetic --label synthetic_mcfw
+python -m kaamba_repo.src.kaamba.scripts.evaluate_model --config eval_results/mcfw/eval_config.json synthetic --label synthetic_mcfw
 ```
 
 **Empirical baseline** — samples i.i.d. from the observed coordinate distribution of the training stimuli. Pass the training split via `--train_stimuli` (the loader_configs.json in each experiment folder lists which stimuli were in the training set):
 
 ```bash
 # GGTG
-python -m kaamba.scripts.evaluate_model --config eval_results/ggtg/eval_config.json empirical --label empirical_ggtg
+python -m kaamba_repo.src.kaamba.scripts.evaluate_model --config eval_results/ggtg/eval_config.json empirical --label empirical_ggtg
 
 # MCFW-Gaze
-python -m kaamba.scripts.evaluate_model --config eval_results/mcfw/eval_config.json empirical --label empirical_mcfw
+python -m kaamba_repo.src.kaamba.scripts.evaluate_model --config eval_results/mcfw/eval_config.json empirical --label empirical_mcfw
 ```
 
 Both commands write results to the same `results/` subfolder structure as the model evaluation, so output can be compared directly. If they complete without errors the full pipeline is confirmed to be working.
@@ -169,16 +170,19 @@ Each experiment has a self-contained `eval_config.json` that records the checkpo
 
 ```bash
 # GGTG · ResNet encoder
-python -m kaamba.scripts.evaluate_model --config eval_results/ggtg/eval_config.json model --label ggtg
-
+python -m kaamba_repo.src.kaamba.scripts.evaluate_model --config eval_results/ggtg/eval_config.json model --label ggtg
+```
+```bash
 # GGTG · no encoder (ablation)
-python -m kaamba.scripts.evaluate_model --config eval_results/ggtg_no_encoder/eval_config.json model --label ggtg_noe
-
+python -m kaamba_repo.src.kaamba.scripts.evaluate_model --config eval_results/ggtg_no_encoder/eval_config.json model --label ggtg_noe
+```
+```bash
 # MCFW-Gaze · SigLIP encoder
-python -m kaamba.scripts.evaluate_model --config eval_results/mcfw/eval_config.json model --label mcfw
-
+python -m kaamba_repo.src.kaamba.scripts.evaluate_model --config eval_results/mcfw/eval_config.json model --label mcfw
+```
+```bash
 # MCFW-Gaze · no encoder (ablation)
-python -m kaamba.scripts.evaluate_model --config eval_results/mcfw_no_encoder/eval_config.json  model --label mcfw_noe
+python -m kaamba_repo.src.kaamba.scripts.evaluate_model --config eval_results/mcfw_no_encoder/eval_config.json  model --label mcfw_noe
 ```
 
 Results are written to the directory specified by `--out_dir` (defaults to the config's own folder). Each run produces per-stimulus JSON files, an `aggregate.json`, and an `eval_report.txt`.
