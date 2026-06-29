@@ -87,7 +87,7 @@ The `mamba-ssm` and `causal-conv1d` packages are pre-built CUDA 12 wheels (torch
 source .venv/bin/activate
 ```
 
-> **Note on the pymovements version:** this project depends on a **custom development branch** of pymovements (`feat/download_stimulus_files`) that adds stimulus-image downloading support. This branch is declared in `kaamba_repo/pyproject.toml` and installed automatically by `uv sync`. Do **not** substitute the PyPI release — the required APIs are not yet available there.
+> **Note on the pymovements version:** this project depends on a **custom development branch** of pymovements (`feat/download_stimulus_files`) that adds stimulus-image downloading support for mcfw-gaze. This branch is declared in `kaamba_repo/pyproject.toml` and installed automatically by `uv sync`. Do **not** substitute the PyPI release — the required APIs are not yet available there.
 
 ---
 
@@ -113,7 +113,7 @@ Stimulus images are downloaded automatically by the `feat/download_stimulus_file
 
 ### MCFW-Gaze: stimulus preprocessing
 
-The raw MCFW-Gaze stimulus images (`data/mcfw-gaze/raw/dataset/stimuli/`) are smaller than the screen resolution used during the experiment. Before using them for training or inference they must be scaled and placed on a full 1920×1080 canvas with letterbox bars, matching the exact pixel coordinates recorded by the eye-tracker. The functions `scale_image_to_screen` and `place_on_screen` in [`kaamba_repo/src/kaamba/utils/image_preprocessing.py`](kaamba_repo/src/kaamba/utils/image_preprocessing.py) handle this. Run the snippet below once after downloading the dataset:
+The raw MCFW-Gaze stimulus images (`data/mcfw-gaze/raw/dataset/stimuli/`) are not scaled to the screen they were presented on during the experiment. Before using them for training or inference they must be scaled and placed on a 1920×1080 canvas with letterbox bars, matching the exact pixel coordinates recorded by the eye-tracker. The functions `scale_image_to_screen` and `place_on_screen` in [`kaamba_repo/src/kaamba/utils/image_preprocessing.py`](kaamba_repo/src/kaamba/utils/image_preprocessing.py) handle this. Run the snippet below once after downloading the dataset:
 
 ```python
 from pathlib import Path
@@ -121,8 +121,7 @@ from PIL import Image
 from kaamba.utils.image_preprocessing import scale_image_to_screen, place_on_screen
 
 raw_dir = Path("data/mcfw-gaze/raw/dataset/stimuli")
-out_dir = Path("data/mcfw-gaze/stimuli")
-out_dir.mkdir(parents=True, exist_ok=True)
+out_dir = Path("data/mcfw-gaze/stimuli/dataset/stimuli")
 
 screen = (1920, 1080)
 for image_id in range(20, 100):
@@ -132,7 +131,35 @@ for image_id in range(20, 100):
     screen_img.save(out_dir / f"{image_id}.jpg")
 ```
 
-The processed images are written to `data/mcfw-gaze/stimuli/`, which is where the dataset pipeline expects to find them.
+The processed images overwrite the images in to `data/mcfw-gaze/stimuli/dataset/stimuli`, which is where the dataset pipeline expects to find them. Original images are preserved in `data/mcfw-gaze/raw/dataset/stimuli`.
+
+---
+
+## Smoke-Testing Without a GPU
+
+The `synthetic` and `empirical` baseline generators do not load the model and require no CUDA or Triton installation. They are a lightweight way to verify that the data pipeline, event detection, and evaluation utilities all work correctly on a new machine.
+
+**Synthetic baseline** — generates step-function scanpaths from physiological fixation/saccade statistics, completely parameter-free:
+
+```bash
+# GGTG
+python -m kaamba.scripts.evaluate_model --config eval_results/ggtg/eval_config.json synthetic --label synthetic_ggtg
+
+# MCFW-Gaze
+python -m kaamba.scripts.evaluate_model --config eval_results/mcfw/eval_config.json synthetic --label synthetic_mcfw
+```
+
+**Empirical baseline** — samples i.i.d. from the observed coordinate distribution of the training stimuli. Pass the training split via `--train_stimuli` (the loader_configs.json in each experiment folder lists which stimuli were in the training set):
+
+```bash
+# GGTG
+python -m kaamba.scripts.evaluate_model --config eval_results/ggtg/eval_config.json empirical --label empirical_ggtg
+
+# MCFW-Gaze
+python -m kaamba.scripts.evaluate_model --config eval_results/mcfw/eval_config.json empirical --label empirical_mcfw
+```
+
+Both commands write results to the same `results/` subfolder structure as the model evaluation, so output can be compared directly. If they complete without errors the full pipeline is confirmed to be working.
 
 ---
 
@@ -142,29 +169,19 @@ Each experiment has a self-contained `eval_config.json` that records the checkpo
 
 ```bash
 # GGTG · ResNet encoder
-python -m kaamba.scripts.evaluate_model \
-    --config eval_results/ggtg/eval_config.json \
-    model --label ggtg
+python -m kaamba.scripts.evaluate_model --config eval_results/ggtg/eval_config.json model --label ggtg
 
 # GGTG · no encoder (ablation)
-python -m kaamba.scripts.evaluate_model \
-    --config eval_results/ggtg_no_encoder/eval_config.json \
-    model --label ggtg_noe
+python -m kaamba.scripts.evaluate_model --config eval_results/ggtg_no_encoder/eval_config.json model --label ggtg_noe
 
 # MCFW-Gaze · SigLIP encoder
-python -m kaamba.scripts.evaluate_model \
-    --config eval_results/mcfw/eval_config.json \
-    model --label mcfw
+python -m kaamba.scripts.evaluate_model --config eval_results/mcfw/eval_config.json model --label mcfw
 
 # MCFW-Gaze · no encoder (ablation)
-python -m kaamba.scripts.evaluate_model \
-    --config eval_results/mcfw_no_encoder/eval_config.json \
-    model --label mcfw_noe
+python -m kaamba.scripts.evaluate_model --config eval_results/mcfw_no_encoder/eval_config.json  model --label mcfw_noe
 ```
 
 Results are written to the directory specified by `--out_dir` (defaults to the config's own folder). Each run produces per-stimulus JSON files, an `aggregate.json`, and an `eval_report.txt`.
-
-> **Paths in eval_config.json:** the `"root"` field is set to `/home/janhof/thesis/data` (the original training server). Adjust this to your local data path if you are reproducing on a different machine.
 
 ---
 
