@@ -78,6 +78,7 @@ class InterleavedLoader:
                 try:
                     yield next(it)
                 except StopIteration:
+                    # restart without caching — itertools.cycle would buffer all batches
                     iters[i] = iter(self.loaders[i])
                     yield next(iters[i])
 
@@ -192,6 +193,7 @@ class DataloaderConfigBuilder:
         batch_size: int = 512,
         num_workers: int = 2,
         seed: int = 42,
+        # NEW: Exclusion parameters
         exclude_participants: Optional[List] = None,
         exclude_stimuli: Optional[List] = None,
         exclude_trials: Optional[List] = None,

@@ -37,7 +37,7 @@ from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-import hashlib
+
 import optuna
 import torch
 from accelerate import Accelerator
@@ -55,7 +55,7 @@ from kaamba.utils.memory_monitor import MemoryMonitor
 
 import os
 
-
+os.environ["NCCL_TIMEOUT"] = "1800"
 # ---------------------------------------------------------------------------
 # Encoder presets
 # ---------------------------------------------------------------------------
@@ -119,7 +119,7 @@ class ExperimentConfig:
     trial_number: Optional[int] = None
     study_name: Optional[str] = None
 
-    log_dir: str = "logs/runs"
+    log_dir: str = "outputs/logs/runs"
     resume_from: Optional[str] = None
 
     def to_dict(self) -> dict:
@@ -422,7 +422,7 @@ def train_on_the_fly(
     exclude_stimuli: Optional[List] = None,
     exclude_trials: Optional[List] = None,
     # Tracking
-    log_dir: str = "logs/runs",
+    log_dir: str = "outputs/logs/runs",
     run_name: Optional[str] = None,
     resume_from: Optional[str] = None,
     use_wandb: bool = False,
@@ -439,8 +439,7 @@ def train_on_the_fly(
     _owns_accelerator = accelerator is None
     if _owns_accelerator:
         accelerator = Accelerator()
-    if accelerator.num_processes > 1:
-        accelerator.wait_for_everyone()
+
     try:
         datasets = [dataset_name] if isinstance(dataset_name, str) else dataset_name
 
@@ -505,15 +504,7 @@ def train_on_the_fly(
             exclude_stimuli=exclude_stimuli,
             exclude_trials=exclude_trials,
         )
-
-        _flag_key = hashlib.md5(
-            json.dumps(loader_kwargs, sort_keys=True, default=str).encode()
-        ).hexdigest()[:12]
-        _cache_ready_flag = Path("/tmp") / f"cache_ready_{_flag_key}.flag"
-
-        # Clean up any stale flag from a previous crashed run
-        if accelerator.is_main_process and _cache_ready_flag.exists():
-            _cache_ready_flag.unlink()
+        _cache_ready_flag = Path("/tmp") / f"cache_ready_{config.run_id}.flag"
 
         if accelerator.is_main_process:
             accelerator.print("Building dataloaders (main process)...")
@@ -522,26 +513,25 @@ def train_on_the_fly(
                 builder.create_loaders(**loader_kwargs)
             )
             tracker.save_loader_configs(loader_configs)
-            gc.collect()
-            torch.cuda.empty_cache()
-            _cache_ready_flag.touch()  # signal others
-            accelerator.print("Dataloaders ready.")
+            accelerator.print("Dataloaders built, waiting for other processes...")
+            _cache_ready_flag.touch()
         else:
+            # poll until main process signals cache is ready
             accelerator.print(
-                f"[rank {accelerator.process_index}] waiting for main process..."
+                f"[rank {accelerator.process_index}] waiting for cache..."
             )
             while not _cache_ready_flag.exists():
-                time.sleep(10)
+                time.sleep(5)
             accelerator.print(
-                f"[rank {accelerator.process_index}] loading from cache..."
+                f"[rank {accelerator.process_index}] cache ready, loading..."
             )
             builder = DataloaderConfigBuilder(**builder_kwargs)
             train_loader, val_loader, test_loader, _ = builder.create_loaders(
                 **loader_kwargs
             )
-            gc.collect()
-            torch.cuda.empty_cache()
 
+        # NOW it's safe to barrier — all processes have their loaders
+        accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             _cache_ready_flag.unlink(missing_ok=True)
 
@@ -655,6 +645,7 @@ def train_on_the_fly(
                     tracker.finish()
                     raise
 
+                # ── Checkpoint ────────────────────────────────────────────────
                 accelerator.wait_for_everyone()
                 tracker.save_checkpoint(
                     accelerator.unwrap_model(model),
@@ -665,6 +656,7 @@ def train_on_the_fly(
                     save_every_epoch=save_every_epoch,
                 )
 
+                # ── Early stopping ────────────────────────────────────────────
                 should_stop = False
                 for fn, args in [
                     (training_monitor.check_loss_validity, (avg_val,)),
@@ -721,6 +713,11 @@ def train_on_the_fly(
             accelerator.end_training()
 
 
+# ---------------------------------------------------------------------------
+# Checkpoint loading
+# ---------------------------------------------------------------------------
+
+
 def _load_checkpoint(path, model, optimizer, scheduler, accelerator) -> int:
     p = Path(path)
     if not p.exists():
@@ -736,6 +733,11 @@ def _load_checkpoint(path, model, optimizer, scheduler, accelerator) -> int:
         f"val={ckpt.get('val_loss', float('nan')):.4f}"
     )
     return ckpt["epoch"]
+
+
+# ---------------------------------------------------------------------------
+# Optuna study
+# ---------------------------------------------------------------------------
 
 
 def run_hparam_search(
@@ -789,7 +791,7 @@ def run_hparam_search(
         # ── Sample hyperparameters ────────────────────────────────────────
         model_config = {
             "encoder_type": trial.suggest_categorical(
-                "encoder_type", ["siglip", "vit", "resnet"]
+                "encoder_type", ["vit", "resnet", "siglip"]
             ),
             "d_model": trial.suggest_categorical("d_model", [128, 256, 512]),
             "n_layers": trial.suggest_int("n_layers", 4, 12),
@@ -809,7 +811,7 @@ def run_hparam_search(
         lr = trial.suggest_float("lr", 1e-6, 1e-3, log=True)
         weight_decay = trial.suggest_float("weight_decay", 1e-7, 1e-3, log=True)
         grad_clip = trial.suggest_float("grad_clip", 0.1, 2.0)
-        batch_size = trial.suggest_categorical("batch_size", [64, 128, 256, 512])
+        batch_size = trial.suggest_categorical("batch_size", [64, 128])
 
         try:
             _, best_val = train_on_the_fly(
@@ -916,14 +918,6 @@ def _load_config(path: str) -> Tuple[dict, dict]:
             "image_embed_dim",
             "conditioning_mode",
             "freeze_encoder",
-            "lr",
-            "batch_size",
-            "num_workers",
-            "num_epochs",
-            "lr",
-            "weight_decay",
-            "grad_clip",
-            "patience",
         }
         model_cfg = {k: v for k, v in params.items() if k in _MODEL_KEYS}
         cli = {k: v for k, v in params.items() if k not in _MODEL_KEYS}
@@ -932,20 +926,17 @@ def _load_config(path: str) -> Tuple[dict, dict]:
     # ── ExperimentConfig config.json ──────────────────────────────────────
     if "model_config" in data or "dataset_names" in data:
         model_cfg = data.pop("model_config", {})
-
-        # these are internal/non-CLI fields that shouldn't override CLI args
         _SKIP = {
             "run_name",
             "run_id",
             "trial_number",
-            "study_name",
+            "split_strategy",
+            "train_ratio",
+            "val_ratio",
+            "test_ratio",
+            "stride",
         }
-
-        # map config.json keys → CLI arg names
-        _KEY_MAP = {
-            "dataset_names": "datasets",
-        }
-
+        _KEY_MAP = {"dataset_names": "datasets"}
         cli = {_KEY_MAP.get(k, k): v for k, v in data.items() if k not in _SKIP}
         return cli, model_cfg
 
@@ -992,7 +983,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--stride",
         type=int,
-        choices=[1, 8, 4, 16],
+        choices=[1, 8],
         default=1,
         help="1 for mcfw gaze 8 for GGTG",
     )
@@ -1023,11 +1014,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # ── train-only ────────────────────────────────────────────────────────
     p.add_argument("--num_epochs", type=int, default=100)
-    p.add_argument("--batch_size", type=int, default=256)
-    p.add_argument("--lr", type=float, default=6.647135865318028e-05)
-    p.add_argument("--weight_decay", type=float, default=4.809461967501569e-07)
-    p.add_argument("--grad_clip", type=float, default=0.22359802667203107)
-    p.add_argument("--patience", type=int, default=6)
+    p.add_argument("--batch_size", type=int, default=None)
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--weight_decay", type=float, default=None)
+    p.add_argument("--grad_clip", type=float, default=None)
+    p.add_argument("--patience", type=int, default=4)
     p.add_argument("--resume_from", default=None)
     p.add_argument("--use_wandb", action="store_true")
 
@@ -1055,25 +1046,32 @@ _DEFAULT_EXCLUDE_PARTICIPANTS_SEARCH = [
     "P06",
     "P07",
     "P18",
-    "P19P08",
-    "P09",
+    "P19",
     "P20",
     "P21",
     "015",
     "014",
     "013",
-    "012001002003",
+    "012",
 ]
 _DEFAULT_EXCLUDE_STIMULI_SEARCH = ["22", "23"]
 _DEFAULT_EXCLUDE_TRIALS_SEARCH = ["", "3", "2", "4", "5"]
 
 
 def main():
+    import os
     import signal
+    import sys
 
     def _cleanup_handler(sig, frame):
         print("\n[interrupted] cleaning up...")
-        raise KeyboardInterrupt
+        try:
+            torch.cuda.empty_cache()
+            if torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
+        except Exception:
+            pass
+        sys.exit(0)
 
     signal.signal(signal.SIGINT, _cleanup_handler)
     signal.signal(signal.SIGTERM, _cleanup_handler)
@@ -1104,13 +1102,12 @@ def main():
     if args.mode == "train":
         # Model config: hardcoded base, updated by any config-file override
         model_config = {
-            "model_name": None,
-            "encoder_type": None,
-            "d_model": None,
-            "n_layers": None,
-            "n_mix": None,
-            "image_embed_dim": None,
-            "conditioning_mode": None,
+            **ENCODER_CONFIGS["siglip"],
+            "d_model": 128,
+            "n_layers": 6,
+            "n_mix": 3,
+            "image_embed_dim": 256,
+            "conditioning_mode": "initial_state",
             "freeze_encoder": True,
         }
         model_config.update(model_config_override)

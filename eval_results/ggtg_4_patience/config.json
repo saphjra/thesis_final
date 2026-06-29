@@ -1,0 +1,43 @@
+{
+  "run_name": "GGTG",
+  "run_id": "20260614_205154",
+  "model_config": {
+    "model_name": null,
+    "encoder_type": "resnet",
+    "d_model": 512,
+    "n_layers": 8,
+    "n_mix": 7,
+    "image_embed_dim": 512,
+    "conditioning_mode": "initial_state",
+    "freeze_encoder": true
+  },
+  "dataset_names": [
+    "GGTG"
+  ],
+  "split_strategy": "stimulus",
+  "train_ratio": 0.7,
+  "val_ratio": 0.15,
+  "test_ratio": 0.15,
+  "context_len": 3200,
+  "stride": 16,
+  "sampling_step": 1,
+  "max_image_size": 224,
+  "exclude_participants": [],
+  "exclude_stimuli": [],
+  "exclude_trials": [
+    "",
+    "4",
+    "5"
+  ],
+  "batch_size": 64,
+  "num_workers": 4,
+  "num_epochs": 100,
+  "lr": 6.647135865318028e-05,
+  "weight_decay": 4.809461967501569e-07,
+  "grad_clip": 0.22359802667203107,
+  "patience": 4,
+  "trial_number": null,
+  "study_name": null,
+  "log_dir": "/home/janhof/thesis/logs/runs",
+  "resume_from": null
+}

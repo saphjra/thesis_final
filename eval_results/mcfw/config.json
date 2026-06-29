@@ -1,0 +1,43 @@
+{
+  "run_name": "mcfw-gaze",
+  "run_id": "20260616_085329",
+  "model_config": {
+    "model_name": "google/siglip-base-patch16-224",
+    "encoder_type": "siglip",
+    "d_model": 512,
+    "n_layers": 11,
+    "n_mix": 4,
+    "image_embed_dim": 256,
+    "conditioning_mode": "initial_state",
+    "freeze_encoder": true
+  },
+  "dataset_names": [
+    "mcfw-gaze"
+  ],
+  "split_strategy": "stimulus",
+  "train_ratio": 0.7,
+  "val_ratio": 0.15,
+  "test_ratio": 0.15,
+  "context_len": 400,
+  "stride": 1,
+  "sampling_step": 1,
+  "max_image_size": 224,
+  "exclude_participants": [],
+  "exclude_stimuli": [],
+  "exclude_trials": [
+    "",
+    "4",
+    "5"
+  ],
+  "batch_size": 256,
+  "num_workers": 2,
+  "num_epochs": 100,
+  "lr": 3.647632269653816e-05,
+  "weight_decay": 5.369809540626191e-06,
+  "grad_clip": 1.3376698730802115,
+  "patience": 4,
+  "trial_number": null,
+  "study_name": null,
+  "log_dir": "/home/janhof/thesis/logs/runs",
+  "resume_from": null
+}

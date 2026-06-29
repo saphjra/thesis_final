@@ -1,0 +1,146 @@
+{
+  "fixation_duration": {
+    "ks_stat": {
+      "mean": NaN,
+      "std": NaN,
+      "n": 0
+    },
+    "p_value": {
+      "mean": NaN,
+      "std": NaN,
+      "n": 0
+    },
+    "n_real": {
+      "mean": 1023.84,
+      "std": 893.6325276085244,
+      "n": 25
+    },
+    "n_fake": {
+      "mean": 0.0,
+      "std": 0.0,
+      "n": 25
+    },
+    "real_mean": {
+      "mean": 207.56578417209556,
+      "std": 20.586742939622184,
+      "n": 25
+    },
+    "fake_mean": {
+      "mean": NaN,
+      "std": NaN,
+      "n": 0
+    },
+    "real_std": {
+      "mean": 107.58291185974386,
+      "std": 26.739352600218865,
+      "n": 25
+    },
+    "fake_std": {
+      "mean": NaN,
+      "std": NaN,
+      "n": 0
+    }
+  },
+  "saccade_amplitude": {
+    "ks_stat": {
+      "mean": NaN,
+      "std": NaN,
+      "n": 0
+    },
+    "p_value": {
+      "mean": NaN,
+      "std": NaN,
+      "n": 0
+    },
+    "n_real": {
+      "mean": 109.24,
+      "std": 100.08607495551017,
+      "n": 25
+    },
+    "n_fake": {
+      "mean": 0.0,
+      "std": 0.0,
+      "n": 25
+    },
+    "real_mean_deg": {
+      "mean": 11.751247434717518,
+      "std": 2.697082161292155,
+      "n": 25
+    },
+    "fake_mean_deg": {
+      "mean": NaN,
+      "std": NaN,
+      "n": 0
+    }
+  },
+  "main_sequence": {
+    "real_r": {
+      "mean": 0.6333219620830217,
+      "std": 0.2065755625694389,
+      "n": 24
+    },
+    "fake_r": {
+      "mean": NaN,
+      "std": NaN,
+      "n": 0
+    }
+  },
+  "intersaccadic_interval": {
+    "real_mean": {
+      "mean": 207.56578417209556,
+      "std": 20.586742939622184,
+      "n": 25
+    },
+    "fake_mean": {
+      "mean": NaN,
+      "std": NaN,
+      "n": 0
+    },
+    "real_var": {
+      "mean": 12289.075901700244,
+      "std": 6666.791137397242,
+      "n": 25
+    },
+    "fake_var": {
+      "mean": NaN,
+      "std": NaN,
+      "n": 0
+    },
+    "mean_err": {
+      "mean": NaN,
+      "std": NaN,
+      "n": 0
+    }
+  },
+  "fixation_density_map": {
+    "kl_divergence": {
+      "mean": NaN,
+      "std": NaN,
+      "n": 0
+    },
+    "real_n_fixations": {
+      "mean": 1023.84,
+      "std": 893.6325276085244,
+      "n": 25
+    },
+    "fake_n_fixations": {
+      "mean": 0.0,
+      "std": 0.0,
+      "n": 25
+    }
+  },
+  "saccade_direction": {
+    "kl_divergence": {
+      "mean": NaN,
+      "std": NaN,
+      "n": 0
+    }
+  },
+  "classifier_auc": {
+    "auc": {
+      "mean": 1.0,
+      "std": 0.0,
+      "n": 8
+    }
+  }
+}

@@ -29,6 +29,7 @@ Wrappers that call all five:
     plot_per_stimulus_metrics(plot_cache, out_dir, sr) -- one set per stimulus
 
 Other figures:
+    plot_best_worst_comparison(all_results, plot_cache, out_path, ...)
     plot_scanpath_overview(plot_cache, out_path, ...)
 """
 
@@ -38,6 +39,7 @@ import math
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
+import matplotlib.gridspec as gridspec
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
@@ -58,6 +60,9 @@ PHYSIO_FIX_MIN_MS = 30.0
 PHYSIO_FIX_MAX_MS = 800.0
 PHYSIO_SAC_MIN_DEG = 0.0
 PHYSIO_SAC_MAX_DEG = 20.0
+
+
+# ── Low-level helpers ─────────────────────────────────────────────────────────
 
 
 def _condition_color(name: str, non_real_index: int) -> str:
@@ -124,6 +129,9 @@ def _ks_annotation(
     )
 
 
+# ── Conditions-data builder ───────────────────────────────────────────────────
+
+
 def build_conditions_data(
     plot_cache: Dict,
     stimuli: Optional[Sequence[str]] = None,
@@ -179,6 +187,9 @@ def build_conditions_data(
             else np.zeros((0, 1, 2)),
         }
     return result
+
+
+# ── Individual metric figures ─────────────────────────────────────────────────
 
 
 def plot_fixation_duration(
@@ -797,6 +808,311 @@ def plot_per_stimulus_metrics(
         stim_dir = out_dir / safe
         stim_dir.mkdir(parents=True, exist_ok=True)
         _plot_all_metrics(conditions_data, stim_dir, sr, title_suffix=stim)
+
+
+# ── Best / worst comparison ───────────────────────────────────────────────────
+
+
+def plot_best_worst_comparison(
+    all_results: Dict,
+    plot_cache: Dict,
+    out_path: "str | Path",
+    score_metric: tuple = ("fixation_duration", "ks_stat"),
+    n_scanpaths: int = 8,
+    density_grid: int = 32,
+    density_sigma: float = 1.5,
+    primary_condition: Optional[str] = None,
+) -> None:
+    """
+    2-row × 5-column figure comparing the best and worst matching stimuli.
+
+    Accepts the condition-keyed plot_cache format.
+    ``primary_condition`` names the generated condition to compare against real;
+    auto-detected if None.
+    """
+    section, key = score_metric
+
+    def _score(m):
+        val = m.get(section, {}).get(key, float("nan"))
+        if np.isnan(val):
+            return float("inf")
+        if section == "classifier_auc" and key == "auc":
+            return abs(val - 0.5)
+        return 1.0 - val
+
+    ranked = sorted(
+        [(s, _score(m)) for s, m in all_results.items() if s in plot_cache],
+        key=lambda x: x[1],
+    )
+    if len(ranked) < 2:
+        print("[plot] need ≥ 2 stimuli — skipping best/worst comparison")
+        return
+
+    best_name, best_score = ranked[0]
+    worst_name, worst_score = ranked[-1]
+
+    # Detect primary condition
+    sample = plot_cache[best_name]
+    if primary_condition is None:
+        non_real = [k for k in sample if k not in ("img_path", "real")]
+        primary_condition = non_real[0] if non_real else "generated"
+
+    def _flat(cache: dict) -> dict:
+        real = cache.get("real", {})
+        fake = cache.get(primary_condition, {})
+        return {
+            "real_seqs": real.get("seqs", np.zeros((0, 1, 2))),
+            "fake_seqs": fake.get("seqs", np.zeros((0, 1, 2))),
+            "real_fix_df": real.get("fix_df"),
+            "fake_fix_df": fake.get("fix_df"),
+            "real_sac_df": real.get("sac_df"),
+            "fake_sac_df": fake.get("sac_df"),
+            "img_path": cache.get("img_path"),
+        }
+
+    flat_best = _flat(plot_cache[best_name])
+    flat_worst = _flat(plot_cache[worst_name])
+
+    ALPHA_T = 0.35
+
+    def _dm(seqs, fix_df, g, sigma):
+        h = np.zeros((g, g))
+        cx = _get_array(fix_df, "cx_deg")
+        cy = _get_array(fix_df, "cy_deg")
+        if len(cx) >= 3:
+            xr = cx.max() - cx.min() or 1.0
+            yr = cy.max() - cy.min() or 1.0
+            xi = ((cx - cx.min()) / xr * (g - 1)).astype(int).clip(0, g - 1)
+            yi = ((cy - cy.min()) / yr * (g - 1)).astype(int).clip(0, g - 1)
+        else:
+            pts = np.clip(seqs.reshape(-1, 2), 0, 1 - 1e-9)
+            xi = (pts[:, 0] * (g - 1)).astype(int).clip(0, g - 1)
+            yi = (pts[:, 1] * (g - 1)).astype(int).clip(0, g - 1)
+        for x, y in zip(xi, yi):
+            h[y, x] += 1
+        return gaussian_filter(h.astype(float) + 1e-8, sigma=sigma)
+
+    def _kde_panel(ax, r_data, f_data, xlabel, unit=""):
+        r_data = r_data[np.isfinite(r_data)]
+        f_data = f_data[np.isfinite(f_data)]
+        if len(r_data) < 3 or len(f_data) < 3:
+            ax.text(
+                0.5,
+                0.5,
+                "insufficient data",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                fontsize=8,
+                color="#888780",
+            )
+            ax.set_xlabel(xlabel + unit, fontsize=8)
+            return
+        xmin = min(np.percentile(r_data, 1), np.percentile(f_data, 1))
+        xmax = max(np.percentile(r_data, 99), np.percentile(f_data, 99))
+        xs = np.linspace(xmin, xmax, 300)
+        kde_r = stats.gaussian_kde(r_data, bw_method=0.3)(xs)
+        kde_f = stats.gaussian_kde(f_data, bw_method=0.3)(xs)
+        ax.fill_between(xs, kde_r, alpha=0.25, color=C_REAL)
+        ax.fill_between(xs, kde_f, alpha=0.25, color=C_FAKE)
+        ax.plot(xs, kde_r, color=C_REAL, lw=1.5, label="real")
+        ax.plot(xs, kde_f, color=C_FAKE, lw=1.5, label=primary_condition)
+        ks, p = stats.ks_2samp(r_data, f_data)
+        ax.set_title(f"KS={ks:.3f}  p={p:.3f}", fontsize=8, pad=3)
+        ax.set_xlabel(xlabel + unit, fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.set_yticks([])
+        for sp in ["top", "right", "left"]:
+            ax.spines[sp].set_visible(False)
+
+    def _draw_row(axes_row, flat, stim_name, metrics, row_label, score):
+        ax_img, ax_scan, ax_fix, ax_sac, ax_dens = axes_row
+
+        # col 0: image
+        try:
+            img = Image.open(flat["img_path"]).convert("RGB")
+            ax_img.imshow(img, aspect="auto")
+        except Exception:
+            ax_img.text(
+                0.5,
+                0.5,
+                "image\nnot found",
+                ha="center",
+                va="center",
+                transform=ax_img.transAxes,
+                fontsize=8,
+                color="#888780",
+            )
+        ax_img.set_xticks([])
+        ax_img.set_yticks([])
+        ax_img.set_title(
+            f"{row_label}\n{stim_name[:28]}",
+            fontsize=8,
+            loc="left",
+            pad=4,
+            color="#444441",
+        )
+        auc = metrics.get("classifier_auc", {}).get("auc", float("nan"))
+        badge = "#1D9E75" if score < 0.15 else "#E8593C"
+        ax_img.text(
+            0.97,
+            0.03,
+            f"AUC {auc:.3f}",
+            transform=ax_img.transAxes,
+            fontsize=7,
+            ha="right",
+            va="bottom",
+            color="white",
+            bbox=dict(boxstyle="round,pad=0.3", fc=badge, ec="none", alpha=0.85),
+        )
+
+        # col 1: scanpaths
+        # norm_y = pixel_y / screen_height  →  0 at top of screen, 1 at bottom.
+        # matplotlib y-axis has 0 at *bottom*, so we must flip: plot_y = 1 - norm_y.
+        for seq in flat["real_seqs"][:n_scanpaths]:
+            ax_scan.plot(seq[:, 0], 1 - seq[:, 1], lw=0.7, alpha=ALPHA_T, color=C_REAL)
+        for seq in flat["fake_seqs"][:n_scanpaths]:
+            ax_scan.plot(seq[:, 0], 1 - seq[:, 1], lw=0.7, alpha=ALPHA_T, color=C_FAKE)
+        for fdf, color in [
+            (flat["real_fix_df"], C_REAL),
+            (flat["fake_fix_df"], C_FAKE),
+        ]:
+            cx = _get_array(fdf, "cx_deg")
+            cy = _get_array(fdf, "cy_deg")
+            dur = _get_array(fdf, "duration")
+            n = min(len(cx), len(cy), len(dur))
+            if n > 0:
+                rng = lambda a: np.nanmax(a) - np.nanmin(a) + 1e-9
+                cx_n = (cx[:n] - np.nanmin(cx[:n])) / rng(cx[:n])
+                # cy_deg in visual-angle space: smaller values = higher on screen
+                # → same inversion needed so fixation dots align with scanpath lines
+                cy_n = 1 - (cy[:n] - np.nanmin(cy[:n])) / rng(cy[:n])
+                sizes = np.clip(dur[:n] / dur[:n].max() * 80, 5, 80)
+                ax_scan.scatter(
+                    cx_n, cy_n, s=sizes, color=color, alpha=0.4, linewidths=0, zorder=3
+                )
+        ax_scan.set_xlim(0, 1)
+        ax_scan.set_ylim(0, 1)
+        ax_scan.set_aspect("equal")
+        ax_scan.set_xticks([])
+        ax_scan.set_yticks([])
+        ax_scan.set_title("Scanpaths", fontsize=8, pad=3)
+        for sp in ax_scan.spines.values():
+            sp.set_linewidth(0.4)
+            sp.set_color("#D3D1C7")
+
+        # col 2 & 3: KDE
+        _kde_panel(
+            ax_fix,
+            _get_array(flat["real_fix_df"], "duration"),
+            _get_array(flat["fake_fix_df"], "duration"),
+            "Fix. duration",
+            " (samples)",
+        )
+        _kde_panel(
+            ax_sac,
+            _get_array(flat["real_sac_df"], "amplitude_deg"),
+            _get_array(flat["fake_sac_df"], "amplitude_deg"),
+            "Sac. amplitude",
+            " (deg)",
+        )
+
+        # col 4: density difference
+        d_r = _dm(flat["real_seqs"], flat["real_fix_df"], density_grid, density_sigma)
+        d_f = _dm(flat["fake_seqs"], flat["fake_fix_df"], density_grid, density_sigma)
+        diff = d_r / d_r.sum() - d_f / d_f.sum()
+        vmax = np.abs(diff).max()
+        im = ax_dens.imshow(
+            diff, cmap="RdBu_r", vmin=-vmax, vmax=vmax, origin="lower", aspect="auto"
+        )
+        ax_dens.set_xticks([])
+        ax_dens.set_yticks([])
+        ax_dens.set_title("Density: real − generated", fontsize=8, pad=3)
+        cbar = plt.colorbar(im, ax=ax_dens, fraction=0.046, pad=0.04)
+        cbar.ax.tick_params(labelsize=6)
+        kl = metrics.get("fixation_density_map", {}).get("kl_divergence", float("nan"))
+        ax_dens.set_xlabel(f"KL div = {kl:.3f}", fontsize=7, labelpad=6)
+
+    fig = plt.figure(figsize=(18, 11), facecolor="white")
+    gs = gridspec.GridSpec(
+        2,
+        5,
+        figure=fig,
+        hspace=0.65,
+        wspace=0.28,
+        left=0.03,
+        right=0.97,
+        top=0.88,
+        bottom=0.08,
+    )
+    axes_best = [fig.add_subplot(gs[0, c]) for c in range(5)]
+    axes_worst = [fig.add_subplot(gs[1, c]) for c in range(5)]
+
+    _draw_row(
+        axes_best,
+        flat_best,
+        best_name,
+        all_results[best_name],
+        "Best match",
+        best_score,
+    )
+    _draw_row(
+        axes_worst,
+        flat_worst,
+        worst_name,
+        all_results[worst_name],
+        "Worst match",
+        worst_score,
+    )
+
+    col_headers = [
+        "Stimulus",
+        "Scanpaths\n(real / generated)",
+        "Fixation duration",
+        "Saccade amplitude",
+        "Fixation density\ndifference",
+    ]
+    for ax, hdr in zip(axes_best, col_headers):
+        ax.annotate(
+            hdr,
+            xy=(0.5, 1.0),
+            xycoords="axes fraction",
+            xytext=(0, 36),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            fontweight=500,
+            color="#444441",
+        )
+
+    fig.legend(
+        handles=[
+            mpatches.Patch(color=C_REAL, alpha=0.7, label="Real data"),
+            mpatches.Patch(
+                color=C_FAKE, alpha=0.7, label=f"Generated ({primary_condition})"
+            ),
+        ],
+        loc="upper right",
+        fontsize=9,
+        frameon=True,
+        framealpha=0.9,
+        edgecolor="#D3D1C7",
+        bbox_to_anchor=(0.97, 0.97),
+    )
+
+    section_label = section.replace("_", " ")
+    fig.suptitle(
+        f"Gaze evaluation — best vs worst stimulus\n"
+        f"Ranked by {section_label} {key}  "
+        f"(best: {best_score:.3f}  worst: {worst_score:.3f})",
+        fontsize=10,
+        y=0.97,
+        va="top",
+        color="#2C2C2A",
+    )
+
+    _safe_fig_save(fig, Path(out_path))
 
 
 # ── Scanpath overview ─────────────────────────────────────────────────────────

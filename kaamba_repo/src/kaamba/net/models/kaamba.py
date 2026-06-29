@@ -44,6 +44,11 @@ class ConditioningMode(str, Enum):
     NONE = "none"
 
 
+# ---------------------------------------------------------------------------
+# Image encoders
+# ---------------------------------------------------------------------------
+
+
 class ViTImageEncoder(nn.Module):
     def __init__(
         self,
@@ -161,14 +166,12 @@ class SigLIPImageEncoder(nn.Module):
             )
 
     def unfreeze_top_k(self, k: int = 1) -> None:
-        """Unfreeze the last k  encoder layers for fine-tuning."""
+        """Unfreeze the last k transformer encoder layers for fine-tuning."""
         layers = self.vision_model.vision_model.encoder.layers
         for layer in layers[-k:]:
             for p in layer.parameters():
                 p.requires_grad = True
         print(f"[SigLIPImageEncoder] Unfroze top {k} encoder layer(s).")
-        n_total = sum(p.numel() for p in self.vision_model.parameters())
-        print(f"[SigLIPImageEncoder] , total={n_total:,} params")
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """
@@ -189,6 +192,11 @@ class SigLIPImageEncoder(nn.Module):
         # SigLIP pooled_output is the mean-pooled patch tokens (no CLS token in SigLIP)
         pooled = outputs.pooler_output  # (B, hidden)
         return self.proj(pooled)
+
+
+# ---------------------------------------------------------------------------
+# Encoder factory
+# ---------------------------------------------------------------------------
 
 
 def build_image_encoder(
@@ -214,6 +222,11 @@ def build_image_encoder(
     raise ValueError(f"Unknown encoder type: {encoder_type}")
 
 
+# ---------------------------------------------------------------------------
+# GMM output head
+# ---------------------------------------------------------------------------
+
+
 class GazeMDNHead(nn.Module):
     """
     Projects d_model → raw GMM parameters.
@@ -222,7 +235,7 @@ class GazeMDNHead(nn.Module):
     before computing the NLL.
 
     Important: clamp log_sx and log_sy to e.g. (-6, 6) before calling exp()
-    in  loss function to prevent NaN during early training.
+    in your loss function to prevent NaN during early training.
     """
 
     def __init__(self, d_model: int, n_mix: int = 5):
@@ -239,6 +252,11 @@ class GazeMDNHead(nn.Module):
         log_sy = out[..., 4]  # (B, T, K)   — clamp then exp for sigma_y
         rho_raw = out[..., 5]  # (B, T, K)   — tanh for correlation in (-1, 1)
         return pi_logits, mu, log_sx, log_sy, rho_raw
+
+
+# ---------------------------------------------------------------------------
+# Main model
+# ---------------------------------------------------------------------------
 
 
 class GazePredictor(nn.Module):
@@ -261,7 +279,7 @@ class GazePredictor(nn.Module):
                         stripped. Simple, but the image signal decays over
                         long sequences due to SSM recurrence.
         EVERY_STEP    — image embedding concatenated to gaze input at every
-                        time step.
+                        time step. Stronger for long or image-dense stimuli.
     """
 
     def __init__(
@@ -273,7 +291,6 @@ class GazePredictor(nn.Module):
         conditioning_mode: str = "initial_state",
         n_mix: int = 5,
         freeze_encoder: bool = True,
-        unfreeze_top: bool = False,
         verbose: bool = True,
         **encoder_kwargs,
     ):
@@ -290,8 +307,6 @@ class GazePredictor(nn.Module):
                 verbose,
                 **encoder_kwargs,
             )
-            if unfreeze_top:
-                self.image_encoder.unfreeze_top_k(1)
         else:
             self.image_encoder = None
             if verbose:
@@ -309,6 +324,7 @@ class GazePredictor(nn.Module):
         )
 
         if self.conditioning_mode == ConditioningMode.INITIAL_STATE:
+            # GELU preserves more encoder signal than Tanh (no hard cap at ±1)
             self.image_to_state = nn.Sequential(
                 nn.Linear(image_embed_dim, d_model),
                 nn.LayerNorm(d_model),
@@ -409,6 +425,11 @@ class CrossAttentionConditioner(nn.Module):
         return x
 
 
+# ---------------------------------------------------------------------------
+# Convenience constructors
+# ---------------------------------------------------------------------------
+
+
 def build_gaze_predictor(
     conditioning_mode: str = "initial_state",
     encoder_type: str = "siglip",
@@ -416,22 +437,29 @@ def build_gaze_predictor(
     n_layers: int = 4,
     image_embed_dim: int = 256,
     freeze_encoder: bool = True,
-    unfreeze_top: bool = False,
     verbose: bool = True,
     **encoder_kwargs,
 ) -> GazePredictor:
     """
+    Convenience factory so callers don't need to import the enums.
 
     Examples:
         # Default: SigLIP + initial state conditioning
         model = build_gaze_predictor()
 
-        # SigLIP with every-step conditioning
+        # SigLIP with every-step conditioning (stronger for long sequences)
         model = build_gaze_predictor(
             conditioning_mode="every_step",
             encoder_type="siglip",
             d_model=256,
             n_layers=6,
+        )
+
+        # Larger SigLIP variant
+        model = build_gaze_predictor(
+            encoder_type="siglip",
+            model_name="google/siglip-large-patch16-384",
+            image_embed_dim=512,
         )
 
         # Fine-tune top encoder layer after building
@@ -445,16 +473,6 @@ def build_gaze_predictor(
         image_embed_dim=image_embed_dim,
         conditioning_mode=conditioning_mode,
         freeze_encoder=freeze_encoder,
-        unfreeze_top=unfreeze_top,
         verbose=verbose,
         **encoder_kwargs,
     )
-
-
-def main():
-    model = build_gaze_predictor(unfreeze_top=True)
-    model = build_gaze_predictor()
-
-
-if __name__ == "__main__":
-    main()

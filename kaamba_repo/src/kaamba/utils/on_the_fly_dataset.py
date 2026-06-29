@@ -287,9 +287,10 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
                 f"{len(image_cache)} unique images cached"
             )
 
-            #   with open(_cache_path, "wb") as f:   #ToDo only uncomment for search
-            #       pickle.dump(self.all_sequences, f)
-            #   print(f"[cache] saved to {_cache_path}")
+            with open(_cache_path, "wb") as f:
+                pickle.dump(self.all_sequences, f)
+            print(f"[cache] saved to {_cache_path}")
+
             print(
                 f"Pre-computed {len(self.all_sequences)} sequences, "
                 f"{len(image_cache)} unique images cached"
@@ -313,12 +314,7 @@ class PymovementsOnTheFlyGazeDataset(IterableDataset):
         if worker_info is not None:
             sequences = sequences[worker_info.id :: worker_info.num_workers]
 
-        for seq in sequences:
-            yield {
-                "input_seq": torch.from_numpy(seq["input_seq"]),
-                "target_seq": torch.from_numpy(seq["target_seq"]),
-                "image": torch.from_numpy(seq["image"]),
-            }
+        yield from iter(sequences)
 
     def __len__(self) -> int:
         return len(self.all_sequences)

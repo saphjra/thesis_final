@@ -182,6 +182,9 @@ class GMMModelGenerator(SequenceGenerator):
             )  # (N, gen_len, 2)
 
 
+# ── Image loading helper ─────────────────────────────────────────────────────
+
+
 def _load_image_tensor(img_path: Path, device: str) -> torch.Tensor:
     """Load and resize an image to (1, 3, 224, 224)."""
     import torchvision.transforms.functional as TF
@@ -190,6 +193,10 @@ def _load_image_tensor(img_path: Path, device: str) -> torch.Tensor:
     img = Image.open(img_path).convert("RGB")
     return TF.to_tensor(TF.resize(img, [224, 224])).unsqueeze(0).to(device)
 
+
+# ---------------------------------------------------------------------------
+# pymovements-native preprocessing helpers
+# ---------------------------------------------------------------------------
 
 _EMPTY_FIX = pl.DataFrame(
     schema={
@@ -330,6 +337,7 @@ def evaluate_stimulus(
             "n_fake": len(b),
         }
 
+    # ── Fixation duration ─────────────────────────────────────────────────
     r_dur = (
         real_fix_df["duration"].to_numpy().astype(float)
         if len(real_fix_df)
@@ -350,6 +358,7 @@ def evaluate_stimulus(
         }
     )
 
+    # ── Saccade amplitude ─────────────────────────────────────────────────
     r_amp = (
         real_sac_df["amplitude_deg"].to_numpy() if len(real_sac_df) else np.array([])
     )
@@ -364,6 +373,7 @@ def evaluate_stimulus(
         }
     )
 
+    # ── Main sequence ─────────────────────────────────────────────────────
     def _ms_r(sac_df):
         if len(sac_df) < 5:
             return float("nan")
@@ -382,6 +392,7 @@ def evaluate_stimulus(
         "pass": fake_r > 0.9 if not np.isnan(fake_r) else False,
     }
 
+    # ── ISI ───────────────────────────────────────────────────────────────
     isi = {
         "real_mean": float(r_dur.mean()) if len(r_dur) else float("nan"),
         "fake_mean": float(f_dur.mean()) if len(f_dur) else float("nan"),
@@ -392,6 +403,7 @@ def evaluate_stimulus(
         else float("nan"),
     }
 
+    # ── Fixation density (KL) ─────────────────────────────────────────────
     def _density(fix_df, grid=32):
         if len(fix_df) == 0:
             return None
@@ -427,6 +439,7 @@ def evaluate_stimulus(
             "fake_n_fixations": len(fake_fix_df),
         }
 
+    # ── Saccade direction ─────────────────────────────────────────────────
     def _dir_hist(sac_df, n=8):
         if len(sac_df) == 0 or "angle_rad" not in sac_df.columns:
             return None
@@ -446,18 +459,19 @@ def evaluate_stimulus(
     else:
         direction = {"kl_divergence": float("nan"), "note": "insufficient saccades"}
 
+    # ── Classifier AUC ────────────────────────────────────────────────────
     def _feats(seqs):
         dx = np.diff(seqs, axis=1)
         speed = np.linalg.norm(dx, axis=-1)
         return np.concatenate(
             [
-                np.nanmean(seqs[:, :, 0], axis=1, keepdims=True),  # mean x
-                np.nanmean(seqs[:, :, 1], axis=1, keepdims=True),  # mean y
-                np.nanstd(seqs[:, :, 0], axis=1, keepdims=True),  # std x
-                np.nanstd(seqs[:, :, 1], axis=1, keepdims=True),  # std y
-                np.nanmean(speed, axis=1, keepdims=True),  # mean speed
-                np.nanstd(speed, axis=1, keepdims=True),  # std speed
-                np.nanmax(speed, axis=1, keepdims=True),  # max speed (peek vel)
+                seqs[:, :, 0].mean(1, keepdims=True),
+                seqs[:, :, 1].mean(1, keepdims=True),
+                seqs[:, :, 0].std(1, keepdims=True),
+                seqs[:, :, 1].std(1, keepdims=True),
+                speed.mean(1, keepdims=True),
+                speed.std(1, keepdims=True),
+                speed.max(1, keepdims=True),
             ],
             axis=1,
         )

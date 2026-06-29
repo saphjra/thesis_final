@@ -1,0 +1,49 @@
+{
+  "fixation_duration": {
+    "ks_stat": NaN,
+    "p_value": NaN,
+    "n_real": 2020,
+    "n_fake": 0,
+    "real_mean": 190.64158415841584,
+    "fake_mean": NaN,
+    "real_std": 85.94316711483272,
+    "fake_std": NaN
+  },
+  "saccade_amplitude": {
+    "ks_stat": NaN,
+    "p_value": NaN,
+    "n_real": 264,
+    "n_fake": 0,
+    "real_mean_deg": 13.016467996838559,
+    "fake_mean_deg": NaN
+  },
+  "main_sequence": {
+    "real_r": 0.42312781709160274,
+    "fake_r": NaN,
+    "pass": false
+  },
+  "intersaccadic_interval": {
+    "real_mean": 190.64158415841584,
+    "fake_mean": NaN,
+    "real_var": 7386.227973728065,
+    "fake_var": NaN,
+    "mean_err": NaN
+  },
+  "fixation_density_map": {
+    "kl_divergence": NaN,
+    "real_n_fixations": 2020,
+    "fake_n_fixations": 0
+  },
+  "saccade_direction": {
+    "kl_divergence": NaN,
+    "note": "insufficient saccades"
+  },
+  "classifier_auc": {
+    "auc": 1.0,
+    "pass": false
+  },
+  "n_real_seqs": 24,
+  "n_fake_seqs": 20,
+  "stimulus": "voicemail-neg.text.0",
+  "time_s": 61.094192028045654
+}

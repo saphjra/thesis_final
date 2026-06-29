@@ -1,0 +1,79 @@
+========================================================================
+GAZE EVALUATION REPORT
+  25 stimuli evaluated in 97.7s
+========================================================================
+
+FIXATION DURATION
+------------------------------------------------------------------------
+                                                     real          fake
+  Mean (samples)                             207.5658 ± 20.5867           n/a
+  Std  (samples)                             107.5829 ± 26.7394           n/a
+  KS statistic                                        n/a
+  KS p-value                                          n/a
+  N fixations — real                         1023.8400 ± 893.6325
+  N fixations — fake                         0.0000 ± 0.0000
+
+SACCADE AMPLITUDE
+------------------------------------------------------------------------
+                                                     real          fake
+  Mean amplitude (deg)                       11.7512 ± 2.6971           n/a
+  KS statistic                                        n/a
+  KS p-value                                          n/a
+
+MAIN SEQUENCE (amplitude–peak-velocity correlation)
+------------------------------------------------------------------------
+  Pearson r — real                           0.6333 ± 0.2066
+  Pearson r — fake                                    n/a
+
+INTERSACCADIC INTERVAL
+------------------------------------------------------------------------
+                                                     real          fake
+  Mean (samples)                             207.5658 ± 20.5867           n/a
+  Variance (samples²)                        12289.0759 ± 6666.7911           n/a
+  |Δ mean| (samples)                                  n/a
+
+SPATIAL METRICS
+------------------------------------------------------------------------
+  Fixation density KL divergence                      n/a
+  Saccade direction KL divergence                     n/a
+
+DISCRIMINABILITY
+------------------------------------------------------------------------
+  Classifier AUC                             1.0000 ± 0.0000
+
+PER-STIMULUS SUMMARY
+------------------------------------------------------------------------
+  Stimulus                                 fix_mean_r fix_mean_f sac_amp_r sac_amp_f  fix_KS  sac_KS     AUC
+  prize-zero.text.4                           207.528        nan    13.486       nan     nan     nan   1.000
+  voicemail-neg.difficulty                    228.179        nan     8.395       nan     nan     nan   1.000
+  voicemail-neg.interest                      255.302        nan     6.509       nan     nan     nan     nan
+  voicemail-neg.naturalness                   253.656        nan    11.146       nan     nan     nan     nan
+  voicemail-neg.question                      200.877        nan     9.175       nan     nan     nan   1.000
+  voicemail-neg.text.0                        190.642        nan    13.016       nan     nan     nan   1.000
+  voicemail-neg.text.1                        187.821        nan    14.879       nan     nan     nan   1.000
+  voicemail-neg.text.2                        185.413        nan    14.937       nan     nan     nan     nan
+  voicemail-neg.text.3                        187.493        nan    14.168       nan     nan     nan   1.000
+  voicemail-pos.difficulty                    206.955        nan     9.044       nan     nan     nan     nan
+  voicemail-pos.interest                      220.989        nan    14.396       nan     nan     nan     nan
+  voicemail-pos.naturalness                   235.960        nan    10.348       nan     nan     nan     nan
+  voicemail-pos.question                      200.882        nan    10.598       nan     nan     nan   1.000
+  voicemail-pos.text.0                        196.763        nan    13.658       nan     nan     nan     nan
+  voicemail-pos.text.1                        198.475        nan    14.174       nan     nan     nan     nan
+  voicemail-pos.text.2                        200.002        nan    15.952       nan     nan     nan   1.000
+  voicemail-pos.text.3                        197.792        nan    14.676       nan     nan     nan     nan
+  voicemail-zero.difficulty                   209.681        nan    10.046       nan     nan     nan     nan
+  voicemail-zero.interest                     243.748        nan     8.119       nan     nan     nan     nan
+  voicemail-zero.naturalness                  216.466        nan     7.745       nan     nan     nan     nan
+  voicemail-zero.question                     208.122        nan     7.926       nan     nan     nan     nan
+  voicemail-zero.text.0                       186.932        nan    12.459       nan     nan     nan     nan
+  voicemail-zero.text.1                       188.246        nan    12.897       nan     nan     nan     nan
+  voicemail-zero.text.2                       189.577        nan    12.468       nan     nan     nan     nan
+  voicemail-zero.text.3                       191.645        nan    13.565       nan     nan     nan     nan
+
+PASS / FAIL (aggregate means)
+------------------------------------------------------------------------
+  FAIL  Fixation KS p > 0.05
+  FAIL  Saccade  KS p > 0.05
+  FAIL  Main seq fake_r > 0.9
+  FAIL  Classifier AUC ≈ 0.5 (|AUC−0.5| < 0.1)
+========================================================================

@@ -1,0 +1,14 @@
+{
+  "dataset":       "mcfw-gaze",
+  "root":          "/home/janhof/thesis/data",
+  "checkpoint":    "/home/janhof/thesis/logs/runs/mcfw-gaze/checkpoints/best_model.pt",
+  "n_generate":    45,
+  "gen_len":       600,
+  "dispersion_threshold": 1.0,
+  "min_fix_dur": 96,
+  "min_sac_dur": 16,
+  "vel_method": "fivepoint",
+  "seed_len": 1,
+  "stimuli":   ["88","89","90","91","92","93","94","95","96","97","98","99"],
+  "temperature": 0.5
+}

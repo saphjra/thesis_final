@@ -1,0 +1,50 @@
+{
+  "fixation_duration": {
+    "ks_stat": NaN,
+    "p_value": NaN,
+    "n_real": 2272,
+    "n_fake": 0,
+    "real_mean": 196.76320422535213,
+    "fake_mean": NaN,
+    "real_std": 82.72802089888054,
+    "fake_std": NaN
+  },
+  "saccade_amplitude": {
+    "ks_stat": NaN,
+    "p_value": NaN,
+    "n_real": 221,
+    "n_fake": 0,
+    "real_mean_deg": 13.657813080405791,
+    "fake_mean_deg": NaN
+  },
+  "main_sequence": {
+    "real_r": 0.6551889074648378,
+    "fake_r": NaN,
+    "pass": false
+  },
+  "intersaccadic_interval": {
+    "real_mean": 196.76320422535213,
+    "fake_mean": NaN,
+    "real_var": 6843.925441845616,
+    "fake_var": NaN,
+    "mean_err": NaN
+  },
+  "fixation_density_map": {
+    "kl_divergence": NaN,
+    "real_n_fixations": 2272,
+    "fake_n_fixations": 0
+  },
+  "saccade_direction": {
+    "kl_divergence": NaN,
+    "note": "insufficient saccades"
+  },
+  "classifier_auc": {
+    "auc": NaN,
+    "pass": false,
+    "note": "too few valid rows after NaN removal"
+  },
+  "n_real_seqs": 22,
+  "n_fake_seqs": 20,
+  "stimulus": "voicemail-pos.text.0",
+  "time_s": 2.3069727420806885
+}
